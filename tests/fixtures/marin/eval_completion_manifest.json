@@ -1,0 +1,52 @@
+{
+  "runs": [
+    {
+      "id": "run_marin_eval_fixture",
+      "name": "run_00097_followup_eval",
+      "external_system": "wandb",
+      "external_id": "fixture-wandb-run",
+      "attrs": {
+        "marin.scale": "300m_6b",
+        "marin.mixture": "proportional"
+      }
+    }
+  ],
+  "jobs": [
+    {
+      "id": "job_marin_eval_fixture",
+      "run_id": "run_marin_eval_fixture",
+      "name": "english-lite-followup",
+      "status": "succeeded",
+      "launcher": "iris",
+      "external_system": "iris",
+      "external_id": "/calvinxu/fixture-english-lite"
+    }
+  ],
+  "artifacts": [
+    {
+      "id": "art_marin_eval_fixture",
+      "run_id": "run_marin_eval_fixture",
+      "job_id": "job_marin_eval_fixture",
+      "type": "eval-result",
+      "uri": "gs://marin-us-east5/fieldbook-fixtures/results.json"
+    }
+  ],
+  "metrics": [
+    {
+      "run_id": "run_marin_eval_fixture",
+      "metric_name": "lm_eval/arc_easy_5shot/acc",
+      "value": 0.42,
+      "source_job_id": "job_marin_eval_fixture",
+      "source_artifact_id": "art_marin_eval_fixture"
+    }
+  ],
+  "notes": [
+    {
+      "id": "note_marin_eval_fixture",
+      "entity_type": "run",
+      "entity_id": "run_marin_eval_fixture",
+      "note_type": "research",
+      "body": "Fixture demonstrates a training run receiving follow-up eval metrics."
+    }
+  ]
+}

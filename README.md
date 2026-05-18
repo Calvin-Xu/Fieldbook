@@ -102,6 +102,101 @@ The first implementation phase intentionally keeps the agent skill as a draft
 usage guide. Publishing a stable, reusable skill is a follow-up once the CLI and
 schema have been dogfooded.
 
+## Agent Quickstart
+
+This quickstart is intentionally written as commands an agent can run in a
+temporary or real ML repo.
+
+```bash
+uv run fieldbook init --json
+```
+
+Create an experiment and capture its ID:
+
+```bash
+EXP_ID=$(uv run fieldbook experiment create \
+  --name "300M eval proxy sprint" \
+  --description "Track training, follow-up evals, and exports" \
+  --tag marin \
+  --attr marin.scale=300m_6b \
+  --json | python -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+```
+
+Record a run, a training job, an artifact, a metric, and a next action:
+
+```bash
+RUN_ID=$(uv run fieldbook run add \
+  --experiment "$EXP_ID" \
+  --name run_00097 \
+  --external-system wandb \
+  --external-id example-wandb-run \
+  --attr marin.mixture=proportional \
+  --json | python -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+JOB_ID=$(uv run fieldbook job add \
+  --run "$RUN_ID" \
+  --name train \
+  --status running \
+  --launcher iris \
+  --external-system iris \
+  --external-id /user/example-train \
+  --command "uv run train.py" \
+  --json | python -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+uv run fieldbook artifact add \
+  --run "$RUN_ID" \
+  --type checkpoint \
+  --uri gs://example/checkpoints/step-100 \
+  --json
+
+uv run fieldbook metric add \
+  --run "$RUN_ID" \
+  --name eval/uncheatable_eval/bpb \
+  --value 0.91 \
+  --step 100 \
+  --source-job "$JOB_ID" \
+  --json
+
+uv run fieldbook note add \
+  --entity-type experiment \
+  --entity-id "$EXP_ID" \
+  --type next-action \
+  --body "Refresh job status and export collaborator table." \
+  --json
+```
+
+Context-switch back to the experiment from any subdirectory:
+
+```bash
+uv run fieldbook experiment status "$EXP_ID" --json
+```
+
+Refresh from a file-based manifest:
+
+```bash
+uv run fieldbook reconcile file \
+  --experiment "$EXP_ID" \
+  --path tests/fixtures/marin/eval_completion_manifest.json \
+  --source "manual-eval-refresh" \
+  --apply \
+  --json
+```
+
+Export collaborator-ready tables:
+
+```bash
+uv run fieldbook export metrics-long \
+  --experiment "$EXP_ID" \
+  --output .experiments/metrics_long.csv \
+  --json
+
+uv run fieldbook export runs-wide \
+  --experiment "$EXP_ID" \
+  --output .experiments/runs_wide.csv \
+  --metric eval/uncheatable_eval/bpb \
+  --json
+```
+
 ## Why "Fieldbook"?
 
 A fieldbook is where researchers keep observations, coordinates, sketches,

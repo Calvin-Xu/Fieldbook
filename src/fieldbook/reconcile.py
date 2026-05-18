@@ -160,7 +160,14 @@ def _plan_run(conn: sqlite3.Connection, row: dict[str, Any], experiment_id: str 
     require_choice(row.get("status", "active"), RUN_STATUSES, "run status")
     existing = _find_entity(conn, "runs", row)
     run_id = existing["id"] if existing else row.get("id", new_id("run"))
-    return {"entity": "runs", "action": "update" if existing else "insert", "id": run_id, "row": {**row, "id": run_id, "experiment_id": row.get("experiment_id", experiment_id)}}
+    target_experiment_id = row.get("experiment_id", experiment_id)
+    _require_active_experiment(conn, target_experiment_id)
+    return {
+        "entity": "runs",
+        "action": "update" if existing else "insert",
+        "id": run_id,
+        "row": {**row, "id": run_id, "experiment_id": target_experiment_id},
+    }
 
 
 def _plan_job(conn: sqlite3.Connection, row: dict[str, Any], experiment_id: str | None) -> dict[str, Any]:
@@ -169,7 +176,14 @@ def _plan_job(conn: sqlite3.Connection, row: dict[str, Any], experiment_id: str 
     validate_utc_z(row.get("finished_at"), "finished_at")
     existing = _find_entity(conn, "jobs", row)
     job_id = existing["id"] if existing else row.get("id", new_id("job"))
-    return {"entity": "jobs", "action": "update" if existing else "insert", "id": job_id, "row": {**row, "id": job_id, "experiment_id": row.get("experiment_id", experiment_id)}}
+    target_experiment_id = row.get("experiment_id", experiment_id)
+    _require_active_experiment(conn, target_experiment_id)
+    return {
+        "entity": "jobs",
+        "action": "update" if existing else "insert",
+        "id": job_id,
+        "row": {**row, "id": job_id, "experiment_id": target_experiment_id},
+    }
 
 
 def _plan_artifact(conn: sqlite3.Connection, row: dict[str, Any], experiment_id: str | None) -> dict[str, Any]:
@@ -177,7 +191,14 @@ def _plan_artifact(conn: sqlite3.Connection, row: dict[str, Any], experiment_id:
     validate_content_hash(row.get("content_hash"))
     existing = _find_entity(conn, "artifacts", row)
     artifact_id = existing["id"] if existing else row.get("id", new_id("art"))
-    return {"entity": "artifacts", "action": "update" if existing else "insert", "id": artifact_id, "row": {**row, "id": artifact_id, "experiment_id": row.get("experiment_id", experiment_id)}}
+    target_experiment_id = row.get("experiment_id", experiment_id)
+    _require_active_experiment(conn, target_experiment_id)
+    return {
+        "entity": "artifacts",
+        "action": "update" if existing else "insert",
+        "id": artifact_id,
+        "row": {**row, "id": artifact_id, "experiment_id": target_experiment_id},
+    }
 
 
 def _plan_metric(conn: sqlite3.Connection, row: dict[str, Any]) -> dict[str, Any]:
@@ -246,6 +267,16 @@ def _find_entity(conn: sqlite3.Connection, table: str, row: dict[str, Any]) -> s
             (row["uri"],),
         ).fetchone()
     return None
+
+
+def _require_active_experiment(conn: sqlite3.Connection, experiment_id: str | None) -> None:
+    if experiment_id is None:
+        return
+    row = conn.execute("SELECT deleted_at FROM experiments WHERE id = ?", (experiment_id,)).fetchone()
+    if row is None:
+        raise ValidationError(f"experiment not found: {experiment_id}")
+    if row["deleted_at"] is not None:
+        raise ValidationError(f"experiment is archived/deleted and cannot be reconciled: {experiment_id}")
 
 
 def _apply_plan(conn: sqlite3.Connection, plan: dict[str, Any]) -> None:

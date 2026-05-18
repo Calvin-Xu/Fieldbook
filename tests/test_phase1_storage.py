@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 from fieldbook.db import CURRENT_SCHEMA_VERSION, connect, discover_ledger, init_ledger, resolve_init_path, schema_version
+from fieldbook.errors import NotFoundError
 from fieldbook.ids import new_id
 
 
@@ -39,6 +40,19 @@ def test_discover_ledger_walks_up_from_subdirectory(tmp_path):
     nested.mkdir(parents=True)
 
     assert discover_ledger(start=nested, env={}) == ledger
+
+
+def test_discover_explicit_missing_ledger_does_not_create(tmp_path):
+    missing = tmp_path / "missing.sqlite"
+
+    try:
+        discover_ledger(ledger=missing, env={})
+    except NotFoundError:
+        pass
+    else:
+        raise AssertionError("expected missing explicit ledger to raise")
+
+    assert not missing.exists()
 
 
 def test_init_ledger_creates_schema_and_pragmas(tmp_path):

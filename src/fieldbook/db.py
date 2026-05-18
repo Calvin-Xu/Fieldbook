@@ -51,10 +51,16 @@ def discover_ledger(
     """Find an existing ledger for non-init commands."""
     env = os.environ if env is None else env
     if ledger is not None:
-        return Path(ledger).expanduser().resolve()
+        ledger_path = Path(ledger).expanduser().resolve()
+        if not ledger_path.exists():
+            raise NotFoundError(f"Fieldbook ledger not found: {ledger_path}")
+        return ledger_path
     env_ledger = env.get("FIELDBOOK_LEDGER")
     if env_ledger:
-        return Path(env_ledger).expanduser().resolve()
+        ledger_path = Path(env_ledger).expanduser().resolve()
+        if not ledger_path.exists():
+            raise NotFoundError(f"Fieldbook ledger not found: {ledger_path}")
+        return ledger_path
 
     start = Path.cwd() if start is None else start
     for candidate in _parents_inclusive(start):

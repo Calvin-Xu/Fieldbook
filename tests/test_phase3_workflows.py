@@ -290,6 +290,8 @@ def test_metric_exports_and_coverage_record_artifacts(tmp_path):
 def test_deleted_experiment_rejects_new_writes(tmp_path):
     ledger = init_ledger(tmp_path)
     experiment_id = create_experiment(ledger)
+    active_experiment = payload(run_fieldbook(ledger, "experiment", "create", "--name", "active"))["id"]
+    run_id = payload(run_fieldbook(ledger, "run", "add", "--experiment", active_experiment, "--name", "run"))["id"]
     run_fieldbook(ledger, "experiment", "archive", experiment_id)
 
     result = run_fieldbook(
@@ -305,6 +307,18 @@ def test_deleted_experiment_rejects_new_writes(tmp_path):
 
     assert result.returncode != 0
     assert "cannot be mutated" in result.stderr
+
+    link_result = run_fieldbook(
+        ledger,
+        "run",
+        "link",
+        run_id,
+        "--experiment",
+        experiment_id,
+        check=False,
+    )
+    assert link_result.returncode != 0
+    assert "cannot be mutated" in link_result.stderr
 
 
 def test_note_decision_and_superseded_are_valid(tmp_path):

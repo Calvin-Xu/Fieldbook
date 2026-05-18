@@ -194,7 +194,7 @@ class Repository:
 
     def link_run(self, *, run_ref: str, experiment_ref: str) -> dict[str, Any]:
         run_id = self.get_run(run_ref)["id"]
-        experiment_id = self.get_experiment(experiment_ref)["id"]
+        experiment_id = self._active_experiment_id(experiment_ref)
         with self.conn:
             self._link_run_ids(experiment_id, run_id)
         return self.get_run(run_id)
@@ -239,7 +239,7 @@ class Repository:
         if run_id and not experiment_id:
             experiment_ids = self._run_experiment_ids(run_id)
             if len(experiment_ids) == 1:
-                experiment_id = experiment_ids[0]
+                experiment_id = self._active_experiment_id(experiment_ids[0])
         code_commit, code_dirty = current_git_revision()
         now = utc_now()
         with self.conn:
@@ -503,6 +503,11 @@ class Repository:
         provenance: dict[tuple[str, str], dict[str, Any]] = {}
         for row in export_rows:
             column = row["metric_name"] if metric_names else self._wide_metric_column(row)
+            if (row["run_id"], column) in values:
+                raise ValidationError(
+                    f"multiple metric rows match wide export column {column!r} for run {row['run_id']}; "
+                    "select a less ambiguous metric set"
+                )
             values[(row["run_id"], column)] = row["value"]
             provenance[(row["run_id"], column)] = self._metric_provenance(row)
         output_path.parent.mkdir(parents=True, exist_ok=True)

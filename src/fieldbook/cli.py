@@ -3,9 +3,16 @@ import json
 import sqlite3
 import sys
 from pathlib import Path
+from typing import Any, Callable
 
-from fieldbook.db import init_ledger, resolve_init_path
-from fieldbook.errors import ExitCode, FieldbookError, LedgerBusyError
+from fieldbook.db import connect, discover_ledger, init_ledger, resolve_init_path
+from fieldbook.errors import ExitCode, FieldbookError, LedgerBusyError, NotFoundError, ValidationError
+from fieldbook.output import emit
+from fieldbook.repository import Repository
+from fieldbook.validation import parse_attrs, validate_metric_value
+
+
+Command = Callable[[argparse.Namespace, Repository], Any]
 
 
 def _add_common_options(parser: argparse.ArgumentParser) -> None:
@@ -13,17 +20,296 @@ def _add_common_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true", help="Emit JSON output")
 
 
+def _add_attr_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--attr", action="append", default=[], help="Namespaced key=value custom attribute")
+
+
+def _with_repo(args: argparse.Namespace, command: Command) -> int:
+    ledger_path = discover_ledger(ledger=args.ledger)
+    if ledger_path is None:
+        raise NotFoundError("Fieldbook ledger not found; run `fieldbook init` first")
+    conn = connect(ledger_path)
+    try:
+        repo = Repository(conn)
+        payload = command(args, repo)
+    finally:
+        conn.close()
+    emit(payload, json_output=args.json)
+    return ExitCode.SUCCESS
+
+
 def _cmd_init(args: argparse.Namespace) -> int:
     ledger_path = resolve_init_path(ledger=args.ledger)
     existed = ledger_path.exists()
     init_ledger(ledger_path)
     payload = {"ledger": str(ledger_path), "existed": existed}
-    if args.json:
-        print(json.dumps(payload, sort_keys=True))
-    else:
-        state = "existing" if existed else "created"
-        print(f"{state} Fieldbook ledger: {ledger_path}")
+    emit(payload, json_output=args.json, text=f"{'existing' if existed else 'created'} Fieldbook ledger: {ledger_path}")
     return ExitCode.SUCCESS
+
+
+def _experiment_create(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.create_experiment(
+        name=args.name,
+        description=args.description,
+        tags=args.tag,
+        attrs=parse_attrs(args.attr),
+    )
+
+
+def _experiment_list(args: argparse.Namespace, repo: Repository) -> list[dict[str, Any]]:
+    rows = repo.list_experiments(tag=args.tag, include_archived=args.include_archived)
+    return [_compact_experiment(row) if not args.verbose else row for row in rows]
+
+
+def _experiment_show(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.get_experiment(args.experiment)
+
+
+def _experiment_status(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.experiment_status(args.experiment)
+
+
+def _experiment_archive(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.archive_experiment(args.experiment)
+
+
+def _run_add(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.add_run(
+        name=args.name,
+        description=args.description,
+        experiment_ref=args.experiment,
+        status=args.status,
+        external_system=args.external_system,
+        external_id=args.external_id,
+        attrs=parse_attrs(args.attr),
+        update_existing=args.update_existing,
+    )
+
+
+def _run_list(args: argparse.Namespace, repo: Repository) -> list[dict[str, Any]]:
+    rows = repo.list_runs(experiment_ref=args.experiment, include_archived=args.include_archived)
+    return [_compact_run(row) if not args.verbose else row for row in rows]
+
+
+def _run_show(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.get_run(args.run)
+
+
+def _run_link(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.link_run(run_ref=args.run, experiment_ref=args.experiment)
+
+
+def _run_archive(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.archive_run(args.run)
+
+
+def _job_add(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.add_job(
+        experiment_ref=args.experiment,
+        run_ref=args.run,
+        name=args.name,
+        status=args.status,
+        command=args.command,
+        launcher=args.launcher,
+        external_system=args.external_system,
+        external_id=args.external_id,
+        failure_reason=args.failure_reason,
+        started_at=args.started_at,
+        finished_at=args.finished_at,
+        attrs=parse_attrs(args.attr),
+        update_existing=args.update_existing,
+    )
+
+
+def _job_update_status(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.update_job_status(
+        job_ref=args.job,
+        status=args.status,
+        failure_reason=args.failure_reason,
+        started_at=args.started_at,
+        finished_at=args.finished_at,
+    )
+
+
+def _job_list(args: argparse.Namespace, repo: Repository) -> list[dict[str, Any]]:
+    rows = repo.list_jobs(
+        experiment_ref=args.experiment,
+        run_ref=args.run,
+        status=args.status,
+        include_archived=args.include_archived,
+    )
+    return [_compact_job(row) if not args.verbose else row for row in rows]
+
+
+def _job_show(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.get_job(args.job)
+
+
+def _job_archive(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.archive_job(args.job)
+
+
+def _artifact_add(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.add_artifact(
+        run_ref=args.run,
+        job_ref=args.job,
+        artifact_type=args.type,
+        uri=args.uri,
+        content_hash=args.content_hash,
+        attrs=parse_attrs(args.attr),
+    )
+
+
+def _artifact_list(args: argparse.Namespace, repo: Repository) -> list[dict[str, Any]]:
+    rows = repo.list_artifacts(
+        run_ref=args.run,
+        job_ref=args.job,
+        artifact_type=args.type,
+        include_archived=args.include_archived,
+    )
+    return [_compact_artifact(row) if not args.verbose else row for row in rows]
+
+
+def _artifact_show(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.get_artifact(args.artifact)
+
+
+def _artifact_archive(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.archive_artifact(args.artifact)
+
+
+def _metric_add(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.add_metric(
+        run_ref=args.run,
+        metric_name=args.name,
+        value=validate_metric_value(args.value),
+        step=args.step,
+        split=args.split,
+        source_job_ref=args.source_job,
+        source_artifact_ref=args.source_artifact,
+    )
+
+
+def _metric_import_csv(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    rows = repo.import_metrics_csv(Path(args.path))
+    return {"imported": len(rows), "metrics": rows}
+
+
+def _metric_list(args: argparse.Namespace, repo: Repository) -> list[dict[str, Any]]:
+    return repo.list_metrics(
+        run_ref=args.run,
+        metric_name=args.name,
+        include_archived=args.include_archived,
+    )
+
+
+def _metric_archive(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.archive_metric(args.metric)
+
+
+def _note_add(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.add_note(
+        entity_type=args.entity_type,
+        entity_ref=args.entity_id,
+        note_type=args.type,
+        status=args.status,
+        body=args.body,
+        author=args.author,
+        attrs=parse_attrs(args.attr),
+    )
+
+
+def _note_list(args: argparse.Namespace, repo: Repository) -> list[dict[str, Any]]:
+    rows = repo.list_notes(
+        entity_type=args.entity_type,
+        entity_ref=args.entity_id,
+        note_type=args.type,
+        status=args.status,
+        include_archived=args.include_archived,
+    )
+    return [_compact_note(row) if not args.verbose else row for row in rows]
+
+
+def _note_resolve(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.resolve_note(args.note)
+
+
+def _note_archive(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.archive_note(args.note)
+
+
+def _compact_experiment(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "status": row["status"],
+        "updated_at": row["updated_at"],
+        "tags": row["tags"],
+    }
+
+
+def _compact_run(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "status": row["status"],
+        "updated_at": row["updated_at"],
+        "experiment_ids": row["experiment_ids"],
+    }
+
+
+def _compact_job(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "status": row["status"],
+        "experiment_id": row["experiment_id"],
+        "run_id": row["run_id"],
+        "updated_at": row["updated_at"],
+        "external_id": row["external_id"],
+    }
+
+
+def _compact_artifact(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "type": row["type"],
+        "uri": row["uri"],
+        "run_id": row["run_id"],
+        "job_id": row["job_id"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _compact_note(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "entity_type": row["entity_type"],
+        "entity_id": row["entity_id"],
+        "note_type": row["note_type"],
+        "status": row["status"],
+        "body": row["body"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _repo_command(command: Command) -> Callable[[argparse.Namespace], int]:
+    return lambda args: _with_repo(args, command)
+
+
+def _common_repo_parser(parser: argparse.ArgumentParser) -> None:
+    _add_common_options(parser)
+
+
+def _add_include_verbose(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--include-archived", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
+
+
+def _add_external_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--external-system")
+    parser.add_argument("--external-id")
+    parser.add_argument("--update-existing", action="store_true")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -34,7 +320,232 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_options(init_parser)
     init_parser.set_defaults(func=_cmd_init)
 
+    _add_experiment_parsers(subparsers)
+    _add_run_parsers(subparsers)
+    _add_job_parsers(subparsers)
+    _add_artifact_parsers(subparsers)
+    _add_metric_parsers(subparsers)
+    _add_note_parsers(subparsers)
     return parser
+
+
+def _add_experiment_parsers(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("experiment", help="Manage experiments")
+    commands = parser.add_subparsers(dest="experiment_command", required=True)
+
+    create = commands.add_parser("create")
+    _common_repo_parser(create)
+    create.add_argument("--name", required=True)
+    create.add_argument("--description")
+    create.add_argument("--tag", action="append", default=[])
+    _add_attr_option(create)
+    create.set_defaults(func=_repo_command(_experiment_create))
+
+    list_parser = commands.add_parser("list")
+    _common_repo_parser(list_parser)
+    list_parser.add_argument("--tag")
+    _add_include_verbose(list_parser)
+    list_parser.set_defaults(func=_repo_command(_experiment_list))
+
+    show = commands.add_parser("show")
+    _common_repo_parser(show)
+    show.add_argument("experiment")
+    show.set_defaults(func=_repo_command(_experiment_show))
+
+    status = commands.add_parser("status")
+    _common_repo_parser(status)
+    status.add_argument("experiment")
+    status.set_defaults(func=_repo_command(_experiment_status))
+
+    archive = commands.add_parser("archive")
+    _common_repo_parser(archive)
+    archive.add_argument("experiment")
+    archive.set_defaults(func=_repo_command(_experiment_archive))
+
+
+def _add_run_parsers(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("run", help="Manage runs")
+    commands = parser.add_subparsers(dest="run_command", required=True)
+
+    add = commands.add_parser("add")
+    _common_repo_parser(add)
+    add.add_argument("--name", required=True)
+    add.add_argument("--description")
+    add.add_argument("--experiment")
+    add.add_argument("--status", default="active")
+    _add_external_options(add)
+    _add_attr_option(add)
+    add.set_defaults(func=_repo_command(_run_add))
+
+    list_parser = commands.add_parser("list")
+    _common_repo_parser(list_parser)
+    list_parser.add_argument("--experiment")
+    _add_include_verbose(list_parser)
+    list_parser.set_defaults(func=_repo_command(_run_list))
+
+    show = commands.add_parser("show")
+    _common_repo_parser(show)
+    show.add_argument("run")
+    show.set_defaults(func=_repo_command(_run_show))
+
+    link = commands.add_parser("link")
+    _common_repo_parser(link)
+    link.add_argument("run")
+    link.add_argument("--experiment", required=True)
+    link.set_defaults(func=_repo_command(_run_link))
+
+    archive = commands.add_parser("archive")
+    _common_repo_parser(archive)
+    archive.add_argument("run")
+    archive.set_defaults(func=_repo_command(_run_archive))
+
+
+def _add_job_parsers(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("job", help="Manage jobs")
+    commands = parser.add_subparsers(dest="job_command", required=True)
+
+    add = commands.add_parser("add")
+    _common_repo_parser(add)
+    add.add_argument("--experiment")
+    add.add_argument("--run")
+    add.add_argument("--name")
+    add.add_argument("--status", default="planned")
+    add.add_argument("--command")
+    add.add_argument("--launcher")
+    add.add_argument("--failure-reason")
+    add.add_argument("--started-at")
+    add.add_argument("--finished-at")
+    _add_external_options(add)
+    _add_attr_option(add)
+    add.set_defaults(func=_repo_command(_job_add))
+
+    update = commands.add_parser("update-status")
+    _common_repo_parser(update)
+    update.add_argument("job")
+    update.add_argument("--status", required=True)
+    update.add_argument("--failure-reason")
+    update.add_argument("--started-at")
+    update.add_argument("--finished-at")
+    update.set_defaults(func=_repo_command(_job_update_status))
+
+    list_parser = commands.add_parser("list")
+    _common_repo_parser(list_parser)
+    list_parser.add_argument("--experiment")
+    list_parser.add_argument("--run")
+    list_parser.add_argument("--status")
+    _add_include_verbose(list_parser)
+    list_parser.set_defaults(func=_repo_command(_job_list))
+
+    show = commands.add_parser("show")
+    _common_repo_parser(show)
+    show.add_argument("job")
+    show.set_defaults(func=_repo_command(_job_show))
+
+    archive = commands.add_parser("archive")
+    _common_repo_parser(archive)
+    archive.add_argument("job")
+    archive.set_defaults(func=_repo_command(_job_archive))
+
+
+def _add_artifact_parsers(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("artifact", help="Manage artifacts")
+    commands = parser.add_subparsers(dest="artifact_command", required=True)
+
+    add = commands.add_parser("add")
+    _common_repo_parser(add)
+    add.add_argument("--run")
+    add.add_argument("--job")
+    add.add_argument("--type", required=True)
+    add.add_argument("--uri", required=True)
+    add.add_argument("--content-hash")
+    _add_attr_option(add)
+    add.set_defaults(func=_repo_command(_artifact_add))
+
+    list_parser = commands.add_parser("list")
+    _common_repo_parser(list_parser)
+    list_parser.add_argument("--run")
+    list_parser.add_argument("--job")
+    list_parser.add_argument("--type")
+    _add_include_verbose(list_parser)
+    list_parser.set_defaults(func=_repo_command(_artifact_list))
+
+    show = commands.add_parser("show")
+    _common_repo_parser(show)
+    show.add_argument("artifact")
+    show.set_defaults(func=_repo_command(_artifact_show))
+
+    archive = commands.add_parser("archive")
+    _common_repo_parser(archive)
+    archive.add_argument("artifact")
+    archive.set_defaults(func=_repo_command(_artifact_archive))
+
+
+def _add_metric_parsers(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("metric", help="Manage metrics")
+    commands = parser.add_subparsers(dest="metric_command", required=True)
+
+    add = commands.add_parser("add")
+    _common_repo_parser(add)
+    add.add_argument("--run", required=True)
+    add.add_argument("--name", required=True)
+    add.add_argument("--value", required=True)
+    add.add_argument("--step")
+    add.add_argument("--split")
+    add.add_argument("--source-job")
+    add.add_argument("--source-artifact")
+    add.set_defaults(func=_repo_command(_metric_add))
+
+    import_csv = commands.add_parser("import-csv")
+    _common_repo_parser(import_csv)
+    import_csv.add_argument("--path", required=True)
+    import_csv.set_defaults(func=_repo_command(_metric_import_csv))
+
+    list_parser = commands.add_parser("list")
+    _common_repo_parser(list_parser)
+    list_parser.add_argument("--run")
+    list_parser.add_argument("--name")
+    list_parser.add_argument("--include-archived", action="store_true")
+    list_parser.set_defaults(func=_repo_command(_metric_list))
+
+    archive = commands.add_parser("archive")
+    _common_repo_parser(archive)
+    archive.add_argument("metric")
+    archive.set_defaults(func=_repo_command(_metric_archive))
+
+
+def _add_note_parsers(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("note", help="Manage notes")
+    commands = parser.add_subparsers(dest="note_command", required=True)
+
+    add = commands.add_parser("add")
+    _common_repo_parser(add)
+    add.add_argument("--entity-type", required=True)
+    add.add_argument("--entity-id", required=True)
+    add.add_argument("--type", required=True)
+    add.add_argument("--status", default="open")
+    add.add_argument("--body", required=True)
+    add.add_argument("--author")
+    _add_attr_option(add)
+    add.set_defaults(func=_repo_command(_note_add))
+
+    list_parser = commands.add_parser("list")
+    _common_repo_parser(list_parser)
+    list_parser.add_argument("--entity-type")
+    list_parser.add_argument("--entity-id")
+    list_parser.add_argument("--type")
+    list_parser.add_argument("--status")
+    _add_include_verbose(list_parser)
+    list_parser.set_defaults(func=_repo_command(_note_list))
+
+    resolve = commands.add_parser("resolve")
+    _common_repo_parser(resolve)
+    resolve.add_argument("note")
+    resolve.set_defaults(func=_repo_command(_note_resolve))
+
+    archive = commands.add_parser("archive")
+    _common_repo_parser(archive)
+    archive.add_argument("note")
+    archive.set_defaults(func=_repo_command(_note_archive))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -50,3 +561,6 @@ def main(argv: list[str] | None = None) -> int:
             print(f"fieldbook: {exc}", file=sys.stderr)
             return LedgerBusyError(str(exc)).exit_code
         raise
+    except Exception as exc:
+        print(f"fieldbook: internal error: {exc}", file=sys.stderr)
+        return ExitCode.INTERNAL_ERROR

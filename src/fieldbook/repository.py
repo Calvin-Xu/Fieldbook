@@ -1,7 +1,9 @@
 import csv
+import json
 import sqlite3
 from collections import Counter
 from collections.abc import Iterable
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +20,7 @@ from fieldbook.validation import (
     NOTE_TYPES,
     RUN_STATUSES,
     attrs_json,
+    file_sha256,
     load_attrs,
     normalize_tag,
     require_choice,
@@ -81,7 +84,7 @@ class Repository:
             )
         return self.get_experiment(experiment["id"])
 
-    def experiment_status(self, ref: str) -> dict[str, Any]:
+    def experiment_status(self, ref: str, *, stale_hours: float = 24.0) -> dict[str, Any]:
         experiment = self.get_experiment(ref)
         experiment_id = experiment["id"]
         run_count = self.conn.execute(
@@ -100,11 +103,44 @@ class Repository:
             "AND status = 'open' AND deleted_at IS NULL",
             (experiment_id,),
         ).fetchone()[0]
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=stale_hours)).isoformat().replace("+00:00", "Z")
+        stale_rows = self.conn.execute(
+            "SELECT * FROM jobs WHERE experiment_id = ? AND status IN ('queued', 'running') "
+            "AND updated_at < ? AND deleted_at IS NULL ORDER BY updated_at LIMIT 20",
+            (experiment_id, cutoff),
+        ).fetchall()
+        failed_rows = self.conn.execute(
+            "SELECT * FROM jobs WHERE experiment_id = ? AND status = 'failed' AND deleted_at IS NULL "
+            "ORDER BY updated_at DESC LIMIT 20",
+            (experiment_id,),
+        ).fetchall()
+        artifact_rows = self.conn.execute(
+            "SELECT * FROM artifacts WHERE experiment_id = ? AND deleted_at IS NULL "
+            "ORDER BY updated_at DESC LIMIT 20",
+            (experiment_id,),
+        ).fetchall()
+        next_actions = self.conn.execute(
+            "SELECT * FROM notes WHERE entity_type = 'experiment' AND entity_id = ? "
+            "AND note_type = 'next-action' AND status = 'open' AND deleted_at IS NULL "
+            "ORDER BY updated_at DESC LIMIT 10",
+            (experiment_id,),
+        ).fetchall()
+        recent_notes = self.conn.execute(
+            "SELECT * FROM notes WHERE entity_type = 'experiment' AND entity_id = ? "
+            "AND deleted_at IS NULL ORDER BY updated_at DESC LIMIT 10",
+            (experiment_id,),
+        ).fetchall()
         return {
             "experiment": experiment,
             "run_count": run_count,
             "job_counts": job_counts,
             "open_note_count": open_notes,
+            "stale_threshold_hours": stale_hours,
+            "stale_jobs": [self._job_dict(row) for row in stale_rows],
+            "failed_jobs": [self._job_dict(row) for row in failed_rows],
+            "key_artifacts": [self._artifact_dict(row) for row in artifact_rows],
+            "next_actions": [self._note_dict(row) for row in next_actions],
+            "recent_notes": [self._note_dict(row) for row in recent_notes],
         }
 
     def add_run(
@@ -323,6 +359,7 @@ class Repository:
     def add_artifact(
         self,
         *,
+        experiment_ref: str | None = None,
         run_ref: str | None,
         job_ref: str | None,
         artifact_type: str,
@@ -332,23 +369,36 @@ class Repository:
     ) -> dict[str, Any]:
         require_choice(artifact_type, ARTIFACT_TYPES, "artifact type")
         validate_content_hash(content_hash)
+        experiment_id = self.get_experiment(experiment_ref)["id"] if experiment_ref else None
         run_id = self.get_run(run_ref)["id"] if run_ref else None
         job_id = self.get_job(job_ref)["id"] if job_ref else None
-        if not run_id and not job_id:
-            raise ValidationError("artifact requires --run or --job")
+        if not experiment_id and not run_id and not job_id:
+            raise ValidationError("artifact requires --experiment, --run, or --job")
         now = utc_now()
         artifact_id = new_id("art")
         with self.conn:
             self.conn.execute(
-                "INSERT INTO artifacts (id, run_id, job_id, type, uri, content_hash, created_at, updated_at, attrs_json) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (artifact_id, run_id, job_id, artifact_type, uri, content_hash, now, now, attrs_json(attrs)),
+                "INSERT INTO artifacts (id, experiment_id, run_id, job_id, type, uri, content_hash, created_at, "
+                "updated_at, attrs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    artifact_id,
+                    experiment_id,
+                    run_id,
+                    job_id,
+                    artifact_type,
+                    uri,
+                    content_hash,
+                    now,
+                    now,
+                    attrs_json(attrs),
+                ),
             )
         return self.get_artifact(artifact_id)
 
     def list_artifacts(
         self,
         *,
+        experiment_ref: str | None = None,
         run_ref: str | None = None,
         job_ref: str | None = None,
         artifact_type: str | None = None,
@@ -356,6 +406,9 @@ class Repository:
     ) -> list[dict[str, Any]]:
         params: list[Any] = [1 if include_archived else 0]
         query = "SELECT * FROM artifacts WHERE (? OR deleted_at IS NULL)"
+        if experiment_ref:
+            query += " AND experiment_id = ?"
+            params.append(self.get_experiment(experiment_ref)["id"])
         if run_ref:
             query += " AND run_id = ?"
             params.append(self.get_run(run_ref)["id"])
@@ -368,6 +421,133 @@ class Repository:
             params.append(artifact_type)
         query += " ORDER BY updated_at DESC, id"
         return [self._artifact_dict(row) for row in self.conn.execute(query, params).fetchall()]
+
+    def export_metrics_long(
+        self,
+        *,
+        experiment_ref: str,
+        output_path: Path,
+        metric_names: list[str] | None,
+    ) -> dict[str, Any]:
+        experiment = self.get_experiment(experiment_ref)
+        rows = self._metric_export_rows(experiment["id"], metric_names)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fieldnames = [
+            "experiment_id",
+            "run_id",
+            "run_name",
+            "metric_id",
+            "metric_name",
+            "value",
+            "step",
+            "split",
+            "source_job_id",
+            "source_artifact_id",
+            "updated_at",
+        ]
+        with output_path.open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        artifact = self.add_artifact(
+            experiment_ref=experiment["id"],
+            run_ref=None,
+            job_ref=None,
+            artifact_type="metric-table",
+            uri=str(output_path),
+            content_hash=file_sha256(output_path),
+            attrs={"fieldbook.export": "metrics-long"},
+        )
+        return {"path": str(output_path), "row_count": len(rows), "artifact": artifact}
+
+    def export_runs_wide(
+        self,
+        *,
+        experiment_ref: str,
+        output_path: Path,
+        metric_names: list[str] | None,
+    ) -> dict[str, Any]:
+        experiment = self.get_experiment(experiment_ref)
+        runs = self.list_runs(experiment_ref=experiment["id"], include_archived=False)
+        export_rows = self._metric_export_rows(experiment["id"], metric_names)
+        metric_columns = self._wide_metric_columns(export_rows, metric_names)
+        values: dict[tuple[str, str], float] = {}
+        for row in export_rows:
+            column = row["metric_name"] if metric_names else self._wide_metric_column(row)
+            values[(row["run_id"], column)] = row["value"]
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fieldnames = ["experiment_id", "run_id", "run_name", "status", "external_system", "external_id", *metric_columns]
+        with output_path.open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for run in runs:
+                row = {
+                    "experiment_id": experiment["id"],
+                    "run_id": run["id"],
+                    "run_name": run["name"],
+                    "status": run["status"],
+                    "external_system": run["external_system"],
+                    "external_id": run["external_id"],
+                }
+                row.update({column: values.get((run["id"], column)) for column in metric_columns})
+                writer.writerow(row)
+        artifact = self.add_artifact(
+            experiment_ref=experiment["id"],
+            run_ref=None,
+            job_ref=None,
+            artifact_type="metric-table",
+            uri=str(output_path),
+            content_hash=file_sha256(output_path),
+            attrs={"fieldbook.export": "runs-wide"},
+        )
+        return {"path": str(output_path), "row_count": len(runs), "metric_columns": metric_columns, "artifact": artifact}
+
+    def export_metric_coverage(
+        self,
+        *,
+        experiment_ref: str,
+        output_path: Path | None,
+        metric_names: list[str] | None,
+    ) -> dict[str, Any]:
+        experiment = self.get_experiment(experiment_ref)
+        total_runs = self.conn.execute(
+            "SELECT COUNT(*) FROM experiment_runs er JOIN runs r ON r.id = er.run_id "
+            "WHERE er.experiment_id = ? AND r.deleted_at IS NULL",
+            (experiment["id"],),
+        ).fetchone()[0]
+        rows = self._metric_export_rows(experiment["id"], metric_names)
+        metric_counts = Counter(row["metric_name"] for row in rows)
+        metric_set = sorted(set(metric_names or metric_counts.keys()))
+        coverage_rows = [
+            {
+                "experiment_id": experiment["id"],
+                "metric_name": metric_name,
+                "run_count": metric_counts.get(metric_name, 0),
+                "total_runs": total_runs,
+                "coverage": metric_counts.get(metric_name, 0) / total_runs if total_runs else 0.0,
+            }
+            for metric_name in metric_set
+        ]
+        artifact = None
+        if output_path:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with output_path.open("w", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=["experiment_id", "metric_name", "run_count", "total_runs", "coverage"],
+                )
+                writer.writeheader()
+                writer.writerows(coverage_rows)
+            artifact = self.add_artifact(
+                experiment_ref=experiment["id"],
+                run_ref=None,
+                job_ref=None,
+                artifact_type="metric-table",
+                uri=str(output_path),
+                content_hash=file_sha256(output_path),
+                attrs={"fieldbook.export": "coverage"},
+            )
+        return {"rows": coverage_rows, "artifact": artifact}
 
     def get_artifact(self, ref: str) -> dict[str, Any]:
         return self._artifact_dict(self._resolve_row("artifacts", ref))
@@ -649,3 +829,33 @@ class Repository:
         data = dict(row)
         data["attrs"] = load_attrs(data.pop("attrs_json", "{}"))
         return data
+
+    def _metric_export_rows(self, experiment_id: str, metric_names: list[str] | None) -> list[dict[str, Any]]:
+        params: list[Any] = [experiment_id]
+        query = (
+            "SELECT er.experiment_id, r.id AS run_id, r.name AS run_name, m.id AS metric_id, m.metric_name, "
+            "m.value, m.step, m.split, m.source_job_id, m.source_artifact_id, m.updated_at "
+            "FROM experiment_runs er "
+            "JOIN runs r ON r.id = er.run_id "
+            "JOIN metrics m ON m.run_id = r.id "
+            "WHERE er.experiment_id = ? AND r.deleted_at IS NULL AND m.deleted_at IS NULL"
+        )
+        if metric_names:
+            placeholders = ", ".join("?" for _ in metric_names)
+            query += f" AND m.metric_name IN ({placeholders})"
+            params.extend(metric_names)
+        query += " ORDER BY r.id, m.metric_name, m.step, m.split"
+        return [dict(row) for row in self.conn.execute(query, params).fetchall()]
+
+    def _wide_metric_columns(self, rows: list[dict[str, Any]], metric_names: list[str] | None) -> list[str]:
+        if metric_names:
+            return metric_names
+        return sorted({self._wide_metric_column(row) for row in rows})
+
+    def _wide_metric_column(self, row: dict[str, Any]) -> str:
+        pieces = [row["metric_name"]]
+        if row.get("step"):
+            pieces.append(f"step={row['step']}")
+        if row.get("split"):
+            pieces.append(f"split={row['split']}")
+        return "|".join(pieces)

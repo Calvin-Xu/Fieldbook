@@ -8,7 +8,7 @@ from fieldbook.errors import LedgerBusyError, NotFoundError
 
 
 DEFAULT_LEDGER_RELATIVE_PATH = Path(".experiments") / "ledger.sqlite"
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 
 def _parents_inclusive(path: Path) -> list[Path]:
@@ -78,8 +78,16 @@ def connect(path: Path) -> sqlite3.Connection:
 
 
 def _migration_sql(version: int) -> str:
-    migration_name = f"{version:03d}_initial.sql"
-    return resources.files("fieldbook.migrations").joinpath(migration_name).read_text()
+    prefix = f"{version:03d}_"
+    migration_files = [
+        path
+        for path in resources.files("fieldbook.migrations").iterdir()
+        if path.name.startswith(prefix) and path.name.endswith(".sql")
+    ]
+    if len(migration_files) != 1:
+        names = ", ".join(sorted(path.name for path in migration_files)) or "none"
+        raise RuntimeError(f"expected one migration for version {version}, found {names}")
+    return migration_files[0].read_text()
 
 
 def schema_version(conn: sqlite3.Connection) -> int:

@@ -50,7 +50,9 @@ def test_init_ledger_creates_schema_and_pragmas(tmp_path):
         assert schema_version(conn) == CURRENT_SCHEMA_VERSION
         assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-        assert conn.execute("SELECT value FROM schema_metadata WHERE key = 'schema_version'").fetchone()[0] == "1"
+        assert conn.execute("SELECT value FROM schema_metadata WHERE key = 'schema_version'").fetchone()[0] == str(
+            CURRENT_SCHEMA_VERSION
+        )
 
         tables = {
             row[0]

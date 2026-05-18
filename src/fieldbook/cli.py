@@ -9,6 +9,7 @@ from fieldbook.db import connect, discover_ledger, init_ledger, resolve_init_pat
 from fieldbook.errors import ExitCode, FieldbookError, LedgerBusyError, NotFoundError, ValidationError
 from fieldbook.output import emit
 from fieldbook.repository import Repository
+from fieldbook.reconcile import load_manifest, reconcile_manifest
 from fieldbook.validation import parse_attrs, validate_metric_value
 
 
@@ -66,7 +67,7 @@ def _experiment_show(args: argparse.Namespace, repo: Repository) -> dict[str, An
 
 
 def _experiment_status(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
-    return repo.experiment_status(args.experiment)
+    return repo.experiment_status(args.experiment, stale_hours=args.stale_hours)
 
 
 def _experiment_archive(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
@@ -151,6 +152,7 @@ def _job_archive(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
 
 def _artifact_add(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
     return repo.add_artifact(
+        experiment_ref=args.experiment,
         run_ref=args.run,
         job_ref=args.job,
         artifact_type=args.type,
@@ -162,6 +164,7 @@ def _artifact_add(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
 
 def _artifact_list(args: argparse.Namespace, repo: Repository) -> list[dict[str, Any]]:
     rows = repo.list_artifacts(
+        experiment_ref=args.experiment,
         run_ref=args.run,
         job_ref=args.job,
         artifact_type=args.type,
@@ -236,6 +239,50 @@ def _note_resolve(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
 
 def _note_archive(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
     return repo.archive_note(args.note)
+
+
+def _reconcile_file(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    manifest = load_manifest(Path(args.path))
+    return reconcile_manifest(
+        repo,
+        manifest=manifest,
+        source=args.source or args.path,
+        experiment_ref=args.experiment,
+        apply=args.apply,
+    )
+
+
+def _export_metrics_long(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.export_metrics_long(
+        experiment_ref=args.experiment,
+        output_path=Path(args.output),
+        metric_names=_metric_names_from_args(args),
+    )
+
+
+def _export_runs_wide(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.export_runs_wide(
+        experiment_ref=args.experiment,
+        output_path=Path(args.output),
+        metric_names=_metric_names_from_args(args),
+    )
+
+
+def _export_coverage(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    output_path = Path(args.output) if args.output else None
+    return repo.export_metric_coverage(
+        experiment_ref=args.experiment,
+        output_path=output_path,
+        metric_names=_metric_names_from_args(args),
+    )
+
+
+def _metric_names_from_args(args: argparse.Namespace) -> list[str] | None:
+    names = list(args.metric or [])
+    if args.metric_file:
+        with Path(args.metric_file).open() as handle:
+            names.extend(line.strip() for line in handle if line.strip())
+    return names or None
 
 
 def _compact_experiment(row: dict[str, Any]) -> dict[str, Any]:
@@ -326,6 +373,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_artifact_parsers(subparsers)
     _add_metric_parsers(subparsers)
     _add_note_parsers(subparsers)
+    _add_reconcile_parsers(subparsers)
+    _add_export_parsers(subparsers)
     return parser
 
 
@@ -355,6 +404,7 @@ def _add_experiment_parsers(subparsers: argparse._SubParsersAction) -> None:
     status = commands.add_parser("status")
     _common_repo_parser(status)
     status.add_argument("experiment")
+    status.add_argument("--stale-hours", type=float, default=24.0)
     status.set_defaults(func=_repo_command(_experiment_status))
 
     archive = commands.add_parser("archive")
@@ -453,6 +503,7 @@ def _add_artifact_parsers(subparsers: argparse._SubParsersAction) -> None:
 
     add = commands.add_parser("add")
     _common_repo_parser(add)
+    add.add_argument("--experiment")
     add.add_argument("--run")
     add.add_argument("--job")
     add.add_argument("--type", required=True)
@@ -463,6 +514,7 @@ def _add_artifact_parsers(subparsers: argparse._SubParsersAction) -> None:
 
     list_parser = commands.add_parser("list")
     _common_repo_parser(list_parser)
+    list_parser.add_argument("--experiment")
     list_parser.add_argument("--run")
     list_parser.add_argument("--job")
     list_parser.add_argument("--type")
@@ -546,6 +598,50 @@ def _add_note_parsers(subparsers: argparse._SubParsersAction) -> None:
     _common_repo_parser(archive)
     archive.add_argument("note")
     archive.set_defaults(func=_repo_command(_note_archive))
+
+
+def _add_reconcile_parsers(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("reconcile", help="Reconcile external manifests")
+    commands = parser.add_subparsers(dest="reconcile_command", required=True)
+
+    file_parser = commands.add_parser("file")
+    _common_repo_parser(file_parser)
+    file_parser.add_argument("--path", required=True)
+    file_parser.add_argument("--source")
+    file_parser.add_argument("--experiment")
+    file_parser.add_argument("--apply", action="store_true")
+    file_parser.set_defaults(func=_repo_command(_reconcile_file))
+
+
+def _add_export_parsers(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("export", help="Export metric tables")
+    commands = parser.add_subparsers(dest="export_command", required=True)
+
+    long_parser = commands.add_parser("metrics-long")
+    _common_repo_parser(long_parser)
+    long_parser.add_argument("--experiment", required=True)
+    long_parser.add_argument("--output", required=True)
+    _add_metric_selection(long_parser)
+    long_parser.set_defaults(func=_repo_command(_export_metrics_long))
+
+    wide = commands.add_parser("runs-wide")
+    _common_repo_parser(wide)
+    wide.add_argument("--experiment", required=True)
+    wide.add_argument("--output", required=True)
+    _add_metric_selection(wide)
+    wide.set_defaults(func=_repo_command(_export_runs_wide))
+
+    coverage = commands.add_parser("coverage")
+    _common_repo_parser(coverage)
+    coverage.add_argument("--experiment", required=True)
+    coverage.add_argument("--output")
+    _add_metric_selection(coverage)
+    coverage.set_defaults(func=_repo_command(_export_coverage))
+
+
+def _add_metric_selection(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--metric", action="append", default=[])
+    parser.add_argument("--metric-file")
 
 
 def main(argv: list[str] | None = None) -> int:

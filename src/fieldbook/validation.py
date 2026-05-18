@@ -22,8 +22,8 @@ ARTIFACT_TYPES = {
     "manifest",
     "other",
 }
-NOTE_TYPES = {"research", "debug", "handoff", "next-action"}
-NOTE_STATUSES = {"open", "resolved"}
+NOTE_TYPES = {"research", "debug", "handoff", "next-action", "decision"}
+NOTE_STATUSES = {"open", "resolved", "superseded"}
 ENTITY_TYPES = {"experiment", "run", "job", "artifact", "metric"}
 
 UTC_Z_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
@@ -72,6 +72,17 @@ def parse_attrs(pairs: list[str] | None) -> dict[str, Any]:
                 f"attribute key {key!r} must be lowercase dotted namespace, e.g. marin.scale"
             )
         attrs[key] = parse_attr_value(raw_value)
+    return attrs
+
+
+def validate_attrs_dict(attrs: dict[str, Any]) -> dict[str, Any]:
+    for key in attrs:
+        if key.startswith("fieldbook."):
+            raise ValidationError("fieldbook.* attributes are reserved")
+        if not ATTR_KEY_RE.match(key):
+            raise ValidationError(
+                f"attribute key {key!r} must be lowercase dotted namespace, e.g. marin.scale"
+            )
     return attrs
 
 

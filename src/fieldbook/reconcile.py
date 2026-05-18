@@ -20,6 +20,7 @@ from fieldbook.validation import (
     load_attrs,
     require_choice,
     validate_content_hash,
+    validate_attrs_dict,
     validate_metric_value,
     validate_utc_z,
 )
@@ -60,6 +61,8 @@ def reconcile_manifest(
     apply: bool,
 ) -> dict[str, Any]:
     experiment_id = repo.get_experiment(experiment_ref)["id"] if experiment_ref else None
+    if experiment_id and repo.get_experiment(experiment_id)["deleted_at"] is not None:
+        raise ValidationError(f"experiment is archived/deleted and cannot be reconciled: {experiment_id}")
     plan = _plan(repo.conn, manifest, experiment_id)
     if not apply:
         return {"source": source, "apply": False, "counts": plan["counts"], "operations": plan["operations"]}
@@ -223,6 +226,7 @@ def _plan_custom_attrs(conn: sqlite3.Connection, row: dict[str, Any]) -> dict[st
     attrs = row.get("attrs")
     if not isinstance(attrs, dict):
         raise ValidationError("custom attribute rows require attrs object")
+    validate_attrs_dict(attrs)
     return {"entity": "custom_attributes", "action": "update", "id": entity_id, "row": row}
 
 
@@ -235,6 +239,11 @@ def _find_entity(conn: sqlite3.Connection, table: str, row: dict[str, Any]) -> s
         return conn.execute(
             f"SELECT * FROM {table} WHERE external_system = ? AND external_id = ? AND deleted_at IS NULL",
             (row["external_system"], row["external_id"]),
+        ).fetchone()
+    if table == "artifacts" and row.get("uri"):
+        return conn.execute(
+            "SELECT * FROM artifacts WHERE uri = ? AND deleted_at IS NULL",
+            (row["uri"],),
         ).fetchone()
     return None
 

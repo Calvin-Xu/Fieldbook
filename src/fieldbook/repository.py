@@ -1,8 +1,6 @@
 import csv
-import json
 import sqlite3
 from collections import Counter
-from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -24,9 +22,9 @@ from fieldbook.validation import (
     load_attrs,
     normalize_tag,
     require_choice,
-    validate_content_hash,
-    validate_metric_value,
-    validate_utc_z,
+        validate_content_hash,
+        validate_metric_value,
+        validate_utc_z,
 )
 
 
@@ -114,11 +112,7 @@ class Repository:
             "ORDER BY updated_at DESC LIMIT 20",
             (experiment_id,),
         ).fetchall()
-        artifact_rows = self.conn.execute(
-            "SELECT * FROM artifacts WHERE experiment_id = ? AND deleted_at IS NULL "
-            "ORDER BY updated_at DESC LIMIT 20",
-            (experiment_id,),
-        ).fetchall()
+        artifact_rows = self._experiment_artifact_rows(experiment_id, limit=20)
         next_actions = self.conn.execute(
             "SELECT * FROM notes WHERE entity_type = 'experiment' AND entity_id = ? "
             "AND note_type = 'next-action' AND status = 'open' AND deleted_at IS NULL "
@@ -162,7 +156,7 @@ class Repository:
             raise AmbiguityError(
                 f"run external identifier {external_system}:{external_id} already exists as {existing['id']}"
             )
-        experiment_id = self.get_experiment(experiment_ref)["id"] if experiment_ref else None
+        experiment_id = self._active_experiment_id(experiment_ref) if experiment_ref else None
         with self.conn:
             if existing:
                 run_id = existing["id"]
@@ -241,7 +235,7 @@ class Repository:
                 f"job external identifier {external_system}:{external_id} already exists as {existing['id']}"
             )
         run_id = self.get_run(run_ref)["id"] if run_ref else None
-        experiment_id = self.get_experiment(experiment_ref)["id"] if experiment_ref else None
+        experiment_id = self._active_experiment_id(experiment_ref) if experiment_ref else None
         if run_id and not experiment_id:
             experiment_ids = self._run_experiment_ids(run_id)
             if len(experiment_ids) == 1:
@@ -366,33 +360,49 @@ class Repository:
         uri: str,
         content_hash: str | None,
         attrs: dict[str, Any],
+        update_existing: bool = False,
     ) -> dict[str, Any]:
         require_choice(artifact_type, ARTIFACT_TYPES, "artifact type")
         validate_content_hash(content_hash)
-        experiment_id = self.get_experiment(experiment_ref)["id"] if experiment_ref else None
+        experiment_id = self._active_experiment_id(experiment_ref) if experiment_ref else None
         run_id = self.get_run(run_ref)["id"] if run_ref else None
         job_id = self.get_job(job_ref)["id"] if job_ref else None
         if not experiment_id and not run_id and not job_id:
             raise ValidationError("artifact requires --experiment, --run, or --job")
+        existing = self.conn.execute(
+            "SELECT id FROM artifacts WHERE uri = ? AND deleted_at IS NULL",
+            (uri,),
+        ).fetchone()
+        if existing and not update_existing:
+            raise AmbiguityError(f"artifact URI already exists as {existing['id']}: {uri}")
         now = utc_now()
-        artifact_id = new_id("art")
         with self.conn:
-            self.conn.execute(
-                "INSERT INTO artifacts (id, experiment_id, run_id, job_id, type, uri, content_hash, created_at, "
-                "updated_at, attrs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    artifact_id,
-                    experiment_id,
-                    run_id,
-                    job_id,
-                    artifact_type,
-                    uri,
-                    content_hash,
-                    now,
-                    now,
-                    attrs_json(attrs),
-                ),
-            )
+            if existing:
+                artifact_id = existing["id"]
+                self.conn.execute(
+                    "UPDATE artifacts SET experiment_id = COALESCE(?, experiment_id), run_id = COALESCE(?, run_id), "
+                    "job_id = COALESCE(?, job_id), type = ?, content_hash = COALESCE(?, content_hash), "
+                    "updated_at = ?, attrs_json = ? WHERE id = ?",
+                    (experiment_id, run_id, job_id, artifact_type, content_hash, now, attrs_json(attrs), artifact_id),
+                )
+            else:
+                artifact_id = new_id("art")
+                self.conn.execute(
+                    "INSERT INTO artifacts (id, experiment_id, run_id, job_id, type, uri, content_hash, created_at, "
+                    "updated_at, attrs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        artifact_id,
+                        experiment_id,
+                        run_id,
+                        job_id,
+                        artifact_type,
+                        uri,
+                        content_hash,
+                        now,
+                        now,
+                        attrs_json(attrs),
+                    ),
+                )
         return self.get_artifact(artifact_id)
 
     def list_artifacts(
@@ -404,6 +414,14 @@ class Repository:
         artifact_type: str | None = None,
         include_archived: bool = False,
     ) -> list[dict[str, Any]]:
+        if experiment_ref and not run_ref and not job_ref and not include_archived:
+            experiment_id = self.get_experiment(experiment_ref)["id"]
+            rows = self._experiment_artifact_rows(experiment_id, limit=1_000_000)
+            artifacts = [self._artifact_dict(row) for row in rows]
+            if artifact_type:
+                require_choice(artifact_type, ARTIFACT_TYPES, "artifact type")
+                artifacts = [artifact for artifact in artifacts if artifact["type"] == artifact_type]
+            return artifacts
         params: list[Any] = [1 if include_archived else 0]
         query = "SELECT * FROM artifacts WHERE (? OR deleted_at IS NULL)"
         if experiment_ref:
@@ -457,6 +475,7 @@ class Repository:
             uri=str(output_path),
             content_hash=file_sha256(output_path),
             attrs={"fieldbook.export": "metrics-long"},
+            update_existing=True,
         )
         return {"path": str(output_path), "row_count": len(rows), "artifact": artifact}
 
@@ -471,12 +490,32 @@ class Repository:
         runs = self.list_runs(experiment_ref=experiment["id"], include_archived=False)
         export_rows = self._metric_export_rows(experiment["id"], metric_names)
         metric_columns = self._wide_metric_columns(export_rows, metric_names)
+        provenance_columns = [
+            f"{column}__source_job_id" for column in metric_columns
+        ] + [
+            f"{column}__source_job_code_commit" for column in metric_columns
+        ] + [
+            f"{column}__source_artifact_id" for column in metric_columns
+        ] + [
+            f"{column}__source_artifact_uri" for column in metric_columns
+        ]
         values: dict[tuple[str, str], float] = {}
+        provenance: dict[tuple[str, str], dict[str, Any]] = {}
         for row in export_rows:
             column = row["metric_name"] if metric_names else self._wide_metric_column(row)
             values[(row["run_id"], column)] = row["value"]
+            provenance[(row["run_id"], column)] = self._metric_provenance(row)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        fieldnames = ["experiment_id", "run_id", "run_name", "status", "external_system", "external_id", *metric_columns]
+        fieldnames = [
+            "experiment_id",
+            "run_id",
+            "run_name",
+            "status",
+            "external_system",
+            "external_id",
+            *metric_columns,
+            *provenance_columns,
+        ]
         with output_path.open("w", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
@@ -490,6 +529,12 @@ class Repository:
                     "external_id": run["external_id"],
                 }
                 row.update({column: values.get((run["id"], column)) for column in metric_columns})
+                for column in metric_columns:
+                    source = provenance.get((run["id"], column), {})
+                    row[f"{column}__source_job_id"] = source.get("source_job_id")
+                    row[f"{column}__source_job_code_commit"] = source.get("source_job_code_commit")
+                    row[f"{column}__source_artifact_id"] = source.get("source_artifact_id")
+                    row[f"{column}__source_artifact_uri"] = source.get("source_artifact_uri")
                 writer.writerow(row)
         artifact = self.add_artifact(
             experiment_ref=experiment["id"],
@@ -499,6 +544,7 @@ class Repository:
             uri=str(output_path),
             content_hash=file_sha256(output_path),
             attrs={"fieldbook.export": "runs-wide"},
+            update_existing=True,
         )
         return {"path": str(output_path), "row_count": len(runs), "metric_columns": metric_columns, "artifact": artifact}
 
@@ -516,15 +562,18 @@ class Repository:
             (experiment["id"],),
         ).fetchone()[0]
         rows = self._metric_export_rows(experiment["id"], metric_names)
-        metric_counts = Counter(row["metric_name"] for row in rows)
-        metric_set = sorted(set(metric_names or metric_counts.keys()))
+        metric_counts = Counter({(row["metric_name"], row["run_id"]) for row in rows})
+        by_metric = Counter()
+        for metric_name, _run_id in metric_counts:
+            by_metric[metric_name] += 1
+        metric_set = sorted(set(metric_names or by_metric.keys()))
         coverage_rows = [
             {
                 "experiment_id": experiment["id"],
                 "metric_name": metric_name,
-                "run_count": metric_counts.get(metric_name, 0),
+                "run_count": by_metric.get(metric_name, 0),
                 "total_runs": total_runs,
-                "coverage": metric_counts.get(metric_name, 0) / total_runs if total_runs else 0.0,
+                "coverage": by_metric.get(metric_name, 0) / total_runs if total_runs else 0.0,
             }
             for metric_name in metric_set
         ]
@@ -546,6 +595,7 @@ class Repository:
                 uri=str(output_path),
                 content_hash=file_sha256(output_path),
                 attrs={"fieldbook.export": "coverage"},
+                update_existing=True,
             )
         return {"rows": coverage_rows, "artifact": artifact}
 
@@ -576,31 +626,20 @@ class Repository:
         run_id = self.get_run(run_ref)["id"]
         source_job_id = self.get_job(source_job_ref)["id"] if source_job_ref else None
         source_artifact_id = self.get_artifact(source_artifact_ref)["id"] if source_artifact_ref else None
-        now = utc_now()
-        existing = self.conn.execute(
-            "SELECT id FROM metrics WHERE run_id = ? AND metric_name = ? AND COALESCE(step, '') = COALESCE(?, '') "
-            "AND COALESCE(split, '') = COALESCE(?, '') AND COALESCE(source_job_id, '') = COALESCE(?, '') "
-            "AND COALESCE(source_artifact_id, '') = COALESCE(?, '') AND deleted_at IS NULL",
-            (run_id, metric_name, step, split, source_job_id, source_artifact_id),
-        ).fetchone()
         with self.conn:
-            if existing:
-                metric_id = existing["id"]
-                self.conn.execute(
-                    "UPDATE metrics SET value = ?, updated_at = ? WHERE id = ?",
-                    (value, now, metric_id),
-                )
-            else:
-                metric_id = new_id("met")
-                self.conn.execute(
-                    "INSERT INTO metrics (id, run_id, metric_name, value, step, split, source_job_id, "
-                    "source_artifact_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (metric_id, run_id, metric_name, value, step, split, source_job_id, source_artifact_id, now, now),
-                )
+            metric_id = self._upsert_metric(
+                run_id=run_id,
+                metric_name=metric_name,
+                value=value,
+                step=step,
+                split=split,
+                source_job_id=source_job_id,
+                source_artifact_id=source_artifact_id,
+            )
         return self.get_metric(metric_id)
 
     def import_metrics_csv(self, path: Path) -> list[dict[str, Any]]:
-        rows: list[dict[str, Any]] = []
+        planned: list[dict[str, Any]] = []
         with path.open(newline="") as handle:
             reader = csv.DictReader(handle)
             for row in reader:
@@ -609,18 +648,34 @@ class Repository:
                 raw_value = row.get("value")
                 if not run_ref or not metric_name or raw_value is None:
                     raise ValidationError("metric CSV requires run_id/run, metric_name/name, and value columns")
-                rows.append(
-                    self.add_metric(
-                        run_ref=run_ref,
-                        metric_name=metric_name,
-                        value=validate_metric_value(raw_value),
-                        step=row.get("step") or None,
-                        split=row.get("split") or None,
-                        source_job_ref=row.get("source_job_id") or None,
-                        source_artifact_ref=row.get("source_artifact_id") or None,
+                planned.append(
+                    {
+                        "run_id": self.get_run(run_ref)["id"],
+                        "metric_name": metric_name,
+                        "value": validate_metric_value(raw_value),
+                        "step": row.get("step") or None,
+                        "split": row.get("split") or None,
+                        "source_job_id": self.get_job(row["source_job_id"])["id"] if row.get("source_job_id") else None,
+                        "source_artifact_id": self.get_artifact(row["source_artifact_id"])["id"]
+                        if row.get("source_artifact_id")
+                        else None,
+                    }
+                )
+        metric_ids: list[str] = []
+        with self.conn:
+            for row in planned:
+                metric_ids.append(
+                    self._upsert_metric(
+                        run_id=row["run_id"],
+                        metric_name=row["metric_name"],
+                        value=row["value"],
+                        step=row["step"],
+                        split=row["split"],
+                        source_job_id=row["source_job_id"],
+                        source_artifact_id=row["source_artifact_id"],
                     )
                 )
-        return rows
+        return [self.get_metric(metric_id) for metric_id in metric_ids]
 
     def list_metrics(
         self,
@@ -725,6 +780,71 @@ class Repository:
         with self.conn:
             self.conn.execute("UPDATE notes SET deleted_at = COALESCE(deleted_at, ?), updated_at = ? WHERE id = ?", (now, now, note["id"]))
         return self.get_note(note["id"])
+
+    def _active_experiment_id(self, ref: str) -> str:
+        experiment = self.get_experiment(ref)
+        if experiment["deleted_at"] is not None:
+            raise ValidationError(f"experiment is archived/deleted and cannot be mutated: {experiment['id']}")
+        return experiment["id"]
+
+    def _experiment_artifact_rows(self, experiment_id: str, *, limit: int) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT DISTINCT a.* FROM artifacts a "
+            "LEFT JOIN experiment_runs er ON er.run_id = a.run_id AND er.experiment_id = ? "
+            "LEFT JOIN jobs j ON j.id = a.job_id "
+            "LEFT JOIN experiment_runs jer ON jer.run_id = j.run_id AND jer.experiment_id = ? "
+            "WHERE a.deleted_at IS NULL AND (a.experiment_id = ? OR er.experiment_id IS NOT NULL "
+            "OR j.experiment_id = ? OR jer.experiment_id IS NOT NULL) "
+            "ORDER BY a.updated_at DESC LIMIT ?",
+            (experiment_id, experiment_id, experiment_id, experiment_id, limit),
+        ).fetchall()
+
+    def _upsert_metric(
+        self,
+        *,
+        run_id: str,
+        metric_name: str,
+        value: float,
+        step: str | None,
+        split: str | None,
+        source_job_id: str | None,
+        source_artifact_id: str | None,
+    ) -> str:
+        now = utc_now()
+        existing = self.conn.execute(
+            "SELECT id FROM metrics WHERE run_id = ? AND metric_name = ? AND COALESCE(step, '') = COALESCE(?, '') "
+            "AND COALESCE(split, '') = COALESCE(?, '') AND COALESCE(source_job_id, '') = COALESCE(?, '') "
+            "AND COALESCE(source_artifact_id, '') = COALESCE(?, '') AND deleted_at IS NULL",
+            (run_id, metric_name, step, split, source_job_id, source_artifact_id),
+        ).fetchone()
+        if existing:
+            metric_id = existing["id"]
+            self.conn.execute(
+                "UPDATE metrics SET value = ?, updated_at = ? WHERE id = ?",
+                (value, now, metric_id),
+            )
+            return metric_id
+        metric_id = new_id("met")
+        self.conn.execute(
+            "INSERT INTO metrics (id, run_id, metric_name, value, step, split, source_job_id, "
+            "source_artifact_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (metric_id, run_id, metric_name, value, step, split, source_job_id, source_artifact_id, now, now),
+        )
+        return metric_id
+
+    def _metric_provenance(self, row: dict[str, Any]) -> dict[str, Any]:
+        job = None
+        artifact = None
+        if row.get("source_job_id"):
+            job = self.conn.execute("SELECT * FROM jobs WHERE id = ?", (row["source_job_id"],)).fetchone()
+        if row.get("source_artifact_id"):
+            artifact = self.conn.execute("SELECT * FROM artifacts WHERE id = ?", (row["source_artifact_id"],)).fetchone()
+        return {
+            "source_job_id": row.get("source_job_id"),
+            "source_job_code_commit": job["code_commit"] if job else None,
+            "source_artifact_id": row.get("source_artifact_id"),
+            "source_artifact_uri": artifact["uri"] if artifact else None,
+        }
 
     def _replace_experiment_tags(self, experiment_id: str, tags: list[str]) -> None:
         self.conn.execute("DELETE FROM experiment_tags WHERE experiment_id = ?", (experiment_id,))

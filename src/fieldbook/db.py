@@ -4,11 +4,11 @@ from importlib import resources
 from pathlib import Path
 from typing import Mapping
 
-from fieldbook.errors import LedgerBusyError, NotFoundError
+from fieldbook.errors import LedgerBusyError, NotFoundError, ValidationError
 
 
 DEFAULT_LEDGER_RELATIVE_PATH = Path(".experiments") / "ledger.sqlite"
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 
 def _parents_inclusive(path: Path) -> list[Path]:
@@ -64,7 +64,7 @@ def discover_ledger(
     raise NotFoundError("no Fieldbook ledger found; run `fieldbook init` first")
 
 
-def connect(path: Path) -> sqlite3.Connection:
+def connect(path: Path, *, migrate: bool = True, allow_newer_readonly: bool = False) -> sqlite3.Connection:
     try:
         conn = sqlite3.connect(path)
     except sqlite3.OperationalError as exc:
@@ -74,6 +74,8 @@ def connect(path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 5000")
+    if migrate:
+        apply_migrations(conn, allow_newer_readonly=allow_newer_readonly)
     return conn
 
 
@@ -90,29 +92,54 @@ def _migration_sql(version: int) -> str:
     return migration_files[0].read_text()
 
 
+def _execute_sql_script(conn: sqlite3.Connection, script: str) -> None:
+    for statement in script.split(";"):
+        sql = statement.strip()
+        if sql:
+            conn.execute(sql)
+
+
 def schema_version(conn: sqlite3.Connection) -> int:
     row = conn.execute("PRAGMA user_version").fetchone()
     return int(row[0])
 
 
-def apply_migrations(conn: sqlite3.Connection) -> None:
+def apply_migrations(conn: sqlite3.Connection, *, allow_newer_readonly: bool = False) -> None:
     current = schema_version(conn)
     if current > CURRENT_SCHEMA_VERSION:
-        return
-    for version in range(current + 1, CURRENT_SCHEMA_VERSION + 1):
-        conn.executescript(_migration_sql(version))
-        conn.execute("PRAGMA user_version = %d" % version)
-        conn.execute(
-            "INSERT OR REPLACE INTO schema_metadata (key, value, updated_at) "
-            "VALUES ('schema_version', ?, datetime('now'))",
-            (str(version),),
+        if allow_newer_readonly:
+            return
+        raise ValidationError(
+            f"ledger schema version {current} is newer than supported version {CURRENT_SCHEMA_VERSION}"
         )
-    conn.commit()
+    conn.execute("BEGIN")
+    try:
+        current = schema_version(conn)
+        if current > CURRENT_SCHEMA_VERSION:
+            if allow_newer_readonly:
+                conn.rollback()
+                return
+            raise ValidationError(
+                f"ledger schema version {current} is newer than supported version {CURRENT_SCHEMA_VERSION}"
+            )
+        for version in range(current + 1, CURRENT_SCHEMA_VERSION + 1):
+            _execute_sql_script(conn, _migration_sql(version))
+            conn.execute("PRAGMA user_version = %d" % version)
+            conn.execute(
+                "INSERT OR REPLACE INTO schema_metadata (key, value, updated_at) "
+                "VALUES ('schema_version', ?, datetime('now'))",
+                (str(version),),
+            )
+    except Exception:
+        conn.rollback()
+        raise
+    else:
+        conn.commit()
 
 
 def init_ledger(path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = connect(path)
+    conn = connect(path, migrate=False)
     try:
         conn.execute("PRAGMA journal_mode = WAL")
         apply_migrations(conn)

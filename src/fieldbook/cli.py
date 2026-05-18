@@ -29,7 +29,7 @@ def _with_repo(args: argparse.Namespace, command: Command) -> int:
     ledger_path = discover_ledger(ledger=args.ledger)
     if ledger_path is None:
         raise NotFoundError("Fieldbook ledger not found; run `fieldbook init` first")
-    conn = connect(ledger_path)
+    conn = connect(ledger_path, allow_newer_readonly=_is_read_only(args))
     try:
         repo = Repository(conn)
         payload = command(args, repo)
@@ -37,6 +37,27 @@ def _with_repo(args: argparse.Namespace, command: Command) -> int:
         conn.close()
     emit(payload, json_output=args.json)
     return ExitCode.SUCCESS
+
+
+def _is_read_only(args: argparse.Namespace) -> bool:
+    command = getattr(args, "command", None)
+    if command == "experiment":
+        return getattr(args, "experiment_command", None) in {"list", "show", "status"}
+    if command == "run":
+        return getattr(args, "run_command", None) in {"list", "show"}
+    if command == "job":
+        return getattr(args, "job_command", None) in {"list", "show"}
+    if command == "artifact":
+        return getattr(args, "artifact_command", None) in {"list", "show"}
+    if command == "metric":
+        return getattr(args, "metric_command", None) == "list"
+    if command == "note":
+        return getattr(args, "note_command", None) == "list"
+    if command == "reconcile":
+        return getattr(args, "reconcile_command", None) == "file" and not getattr(args, "apply", False)
+    if command == "export":
+        return getattr(args, "export_command", None) == "coverage" and not getattr(args, "output", None)
+    return False
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
@@ -159,6 +180,7 @@ def _artifact_add(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
         uri=args.uri,
         content_hash=args.content_hash,
         attrs=parse_attrs(args.attr),
+        update_existing=args.update_existing,
     )
 
 
@@ -509,6 +531,7 @@ def _add_artifact_parsers(subparsers: argparse._SubParsersAction) -> None:
     add.add_argument("--type", required=True)
     add.add_argument("--uri", required=True)
     add.add_argument("--content-hash")
+    add.add_argument("--update-existing", action="store_true")
     _add_attr_option(add)
     add.set_defaults(func=_repo_command(_artifact_add))
 

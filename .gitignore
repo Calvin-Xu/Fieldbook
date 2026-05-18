@@ -1,0 +1,10 @@
+.DS_Store
+.experiments/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyrefly/
+.venv/
+dist/
+*.egg-info/

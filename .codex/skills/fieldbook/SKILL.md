@@ -139,6 +139,41 @@ uv run fieldbook reconcile log --event "$RECONCILE_EVENT_ID" --json
 uv run fieldbook reconcile log --source iris-refresh --operations --json
 ```
 
+## W&B Writeback
+
+Use writeback only when the user explicitly wants Fieldbook metrics mirrored to
+W&B. Fieldbook stays the source of truth.
+
+Always dry-run first:
+
+```bash
+uv run fieldbook writeback wandb --run "$RUN_ID" --metric "eval/*" --json
+```
+
+Apply requires an explicit writer and, on the first Fieldbook write to a target
+W&B run, `--first-write-ok`:
+
+```bash
+uv run fieldbook writeback wandb \
+  --run "$RUN_ID" \
+  --metric "eval/*" \
+  --apply \
+  --writer real \
+  --first-write-ok \
+  --json
+```
+
+Default W&B keys are `fieldbook/<metric_name>` to avoid clobbering training
+metrics. Use `--writer fake` for local smoke tests. Do not use `--raw-keys`
+unless the user explicitly accepts overwriting risk; it requires
+`--force-target`.
+
+Inspect history with:
+
+```bash
+uv run fieldbook writeback log --target-system wandb --json
+```
+
 Use adapters when the external system state is already available as a local
 snapshot. Adapters are pure translators: they never read or mutate the ledger.
 They produce reconcile manifests and optional debug files:

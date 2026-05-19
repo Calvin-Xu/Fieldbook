@@ -22,6 +22,7 @@ EXPECTED_VIEWS = {
     "v_artifact_latest_per_type_v1",
     "v_metric_coverage_v1",
     "v_wandb_sync_coverage_v1",
+    "v_wandb_writeback_coverage_v1",
     "v_reconcile_log_v1",
 }
 

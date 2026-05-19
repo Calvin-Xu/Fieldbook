@@ -48,9 +48,17 @@ LIMIT 20;
 ## W&B Sync Coverage
 
 ```sql
-SELECT run_id, name, external_id, latest_sync_status, latest_sync_at
+SELECT run_id, run_name, external_id, latest_wandb_sync_status, latest_wandb_sync_at
 FROM v_wandb_sync_coverage_v1
-ORDER BY latest_sync_at DESC;
+ORDER BY latest_wandb_sync_at DESC;
+```
+
+## W&B Writeback Coverage
+
+```sql
+SELECT source_run_id, source_entity_id, target_identifier, target_field, latest_status, attempt_count
+FROM v_wandb_writeback_coverage_v1
+ORDER BY latest_event_at DESC;
 ```
 
 Run examples through the read-only SQL command:

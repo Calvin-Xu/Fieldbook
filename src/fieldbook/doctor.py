@@ -364,7 +364,8 @@ def _check_sync_events(conn: sqlite3.Connection, _options: DoctorOptions) -> lis
     duplicates = conn.execute(
         "SELECT target_system, COALESCE(target_identifier, '') AS target_identifier, idempotency_key, "
         "GROUP_CONCAT(id, ', ') AS ids, COUNT(*) AS n FROM sync_events "
-        "WHERE idempotency_key IS NOT NULL GROUP BY target_system, COALESCE(target_identifier, ''), idempotency_key "
+        "WHERE idempotency_key IS NOT NULL AND origin = 'manifest' "
+        "GROUP BY target_system, COALESCE(target_identifier, ''), idempotency_key "
         "HAVING COUNT(*) > 1"
     ).fetchall()
     for row in duplicates:
@@ -376,6 +377,31 @@ def _check_sync_events(conn: sqlite3.Connection, _options: DoctorOptions) -> lis
                 message="sync events share an idempotency key",
                 details=dict(row),
                 suggested_next_action="Inspect duplicate sync events and confirm reconcile idempotency.",
+            )
+        )
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=_options.stale_hours)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    failed_writebacks = conn.execute(
+        "WITH ranked AS ("
+        "SELECT id, run_id, source_entity_id, target_identifier, target_field, error_message, created_at, status, "
+        "ROW_NUMBER() OVER (PARTITION BY target_system, COALESCE(target_identifier, ''), idempotency_key "
+        "ORDER BY created_at DESC, id DESC) AS rn "
+        "FROM sync_events WHERE origin = 'writeback' AND idempotency_key IS NOT NULL"
+        ") "
+        "SELECT id, run_id, source_entity_id, target_identifier, target_field, error_message, created_at "
+        "FROM ranked WHERE rn = 1 AND status = 'failed' AND created_at <= ? "
+        "ORDER BY created_at DESC, id DESC",
+        (cutoff,),
+    ).fetchall()
+    for row in failed_writebacks:
+        issues.append(
+            DoctorIssue(
+                code="sync_event.failed_writeback",
+                severity="warning",
+                entity_type="sync_event",
+                entity_id=row["id"],
+                message="writeback sync event failed and may need retry",
+                details=dict(row),
+                suggested_next_action="Inspect writeback log and rerun the explicit writeback command if appropriate.",
             )
         )
     return issues

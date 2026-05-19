@@ -23,6 +23,7 @@ from fieldbook.reconcile import load_manifest, reconcile_log, reconcile_manifest
 from fieldbook.snapshot import export_snapshot, import_snapshot, inspect_snapshot
 from fieldbook.sql_query import DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_SQL_LIMIT, DEFAULT_SQL_TIMEOUT, execute_readonly_sql, resolve_sql_text
 from fieldbook.validation import NOTE_BODY_FORMATS, parse_attrs, validate_metric_value
+from fieldbook.writeback import apply_wandb_writeback, plan_wandb_writeback, wandb_writeback_log, writer_from_name
 
 
 Command = Callable[[argparse.Namespace, Repository], Any]
@@ -71,6 +72,10 @@ def _is_read_only(args: argparse.Namespace) -> bool:
         )
     if command in {"db", "sql"}:
         return True
+    if command == "writeback":
+        return getattr(args, "writeback_command", None) == "log" or (
+            getattr(args, "writeback_command", None) == "wandb" and not getattr(args, "apply", False)
+        )
     if command == "export":
         return getattr(args, "export_command", None) == "coverage" and not getattr(args, "output", None)
     return False
@@ -186,6 +191,41 @@ def _adapter_run(args: argparse.Namespace) -> int:
         return ExitCode.SUCCESS
     emit(result.summary(output=args.output, debug_output=args.debug_output), json_output=args.json)
     return ExitCode.SUCCESS
+
+
+def _writeback_wandb(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    if args.apply and not args.writer:
+        raise ValidationError("--apply requires explicit --writer")
+    if args.apply and args.raw_keys and not args.force_target:
+        raise ValidationError("--raw-keys requires --force-target for apply-safe target acknowledgement")
+    plan = plan_wandb_writeback(
+        repo.conn,
+        run_ref=args.run,
+        metric_patterns=args.metric,
+        target_run=args.target_run,
+        key_prefix=args.key_prefix,
+        raw_keys=args.raw_keys,
+        force_target=args.force_target,
+        enforce_target_guard=args.apply,
+        allow_rewrite=args.allow_rewrite,
+    )
+    if not args.apply:
+        return plan
+    writer = writer_from_name(args.writer, fake_fail_fields=args.fake_fail_field)
+    return apply_wandb_writeback(repo.conn, plan=plan, writer=writer, first_write_ok=args.first_write_ok)
+
+
+def _writeback_log(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return wandb_writeback_log(
+        repo.conn,
+        target_system=args.target_system,
+        status=args.status,
+        run_id=args.run,
+        target_identifier=args.target_identifier,
+        origin=args.origin,
+        source_entity_id=args.source_entity,
+        limit=args.limit,
+    )
 
 
 def _experiment_create(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
@@ -642,6 +682,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_metric_parsers(subparsers)
     _add_note_parsers(subparsers)
     _add_reconcile_parsers(subparsers)
+    _add_writeback_parsers(subparsers)
     _add_export_parsers(subparsers)
     _add_adapter_parsers(subparsers)
     _add_doctor_parser(subparsers)
@@ -969,6 +1010,37 @@ def _add_reconcile_parsers(subparsers: argparse._SubParsersAction) -> None:
     log_parser.add_argument("--limit", type=int, default=20)
     log_parser.add_argument("--operations", action="store_true")
     log_parser.set_defaults(func=_repo_command(_reconcile_log))
+
+
+def _add_writeback_parsers(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("writeback", help="Push Fieldbook data to external systems")
+    commands = parser.add_subparsers(dest="writeback_command", required=True)
+
+    wandb = commands.add_parser("wandb", help="Write Fieldbook metrics to W&B summaries")
+    _common_repo_parser(wandb)
+    wandb.add_argument("--run", required=True)
+    wandb.add_argument("--metric", action="append", required=True)
+    wandb.add_argument("--target-run")
+    wandb.add_argument("--key-prefix")
+    wandb.add_argument("--raw-keys", action="store_true")
+    wandb.add_argument("--force-target", action="store_true")
+    wandb.add_argument("--allow-rewrite", action="store_true")
+    wandb.add_argument("--apply", action="store_true")
+    wandb.add_argument("--writer", choices=["fake", "real"])
+    wandb.add_argument("--first-write-ok", action="store_true")
+    wandb.add_argument("--fake-fail-field", action="append", default=[])
+    wandb.set_defaults(func=_repo_command(_writeback_wandb))
+
+    log = commands.add_parser("log", help="Inspect writeback sync events")
+    _common_repo_parser(log)
+    log.add_argument("--target-system")
+    log.add_argument("--status")
+    log.add_argument("--run")
+    log.add_argument("--target-identifier")
+    log.add_argument("--origin")
+    log.add_argument("--source-entity")
+    log.add_argument("--limit", type=int, default=20)
+    log.set_defaults(func=_repo_command(_writeback_log))
 
 
 def _add_db_parsers(subparsers: argparse._SubParsersAction) -> None:

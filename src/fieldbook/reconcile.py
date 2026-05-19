@@ -517,6 +517,11 @@ def _plan_sync_event(conn: sqlite3.Connection, row: dict[str, Any], *, order: in
     clean = _clean_row(row)
     if not clean.get("target_system") or not clean.get("status"):
         raise ValidationError("sync_events require target_system and status")
+    if clean.get("origin") == "writeback":
+        raise ValidationError("reconcile manifests cannot insert sync_events with origin='writeback'")
+    provenance_keys = {"source_entity_type", "source_entity_id", "target_field", "payload_summary_json"}
+    if any(key in clean for key in provenance_keys):
+        raise ValidationError("reconcile manifests cannot set writeback-only sync_event provenance columns")
     require_choice(clean["status"], SYNC_EVENT_STATUSES, "sync event status")
     attrs = clean.get("attrs", {})
     if not isinstance(attrs, dict):
@@ -527,7 +532,7 @@ def _plan_sync_event(conn: sqlite3.Connection, row: dict[str, Any], *, order: in
     if idempotency_key:
         existing = conn.execute(
             "SELECT * FROM sync_events WHERE target_system = ? AND COALESCE(target_identifier, '') = COALESCE(?, '') "
-            "AND idempotency_key = ?",
+            "AND idempotency_key = ? AND origin = 'manifest'",
             (clean["target_system"], clean.get("target_identifier"), idempotency_key),
         ).fetchone()
     if existing:
@@ -864,7 +869,8 @@ def _apply_sync_event(conn: sqlite3.Connection, operation: dict[str, Any], *, re
     row = operation["row"]
     conn.execute(
         "INSERT INTO sync_events (id, target_system, target_identifier, status, run_id, job_id, error_message, "
-        "reconcile_event_id, idempotency_key, created_at, attrs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "reconcile_event_id, idempotency_key, origin, source_entity_type, source_entity_id, target_field, "
+        "payload_summary_json, created_at, attrs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             row["id"],
             row["target_system"],
@@ -875,6 +881,11 @@ def _apply_sync_event(conn: sqlite3.Connection, operation: dict[str, Any], *, re
             row.get("error_message"),
             reconcile_event_id,
             row.get("idempotency_key"),
+            row.get("origin", "manifest"),
+            row.get("source_entity_type"),
+            row.get("source_entity_id"),
+            row.get("target_field"),
+            row.get("payload_summary_json"),
             utc_now(),
             attrs_json(row.get("attrs", {})),
         ),

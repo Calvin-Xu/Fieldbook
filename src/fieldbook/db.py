@@ -8,7 +8,7 @@ from fieldbook.errors import LedgerBusyError, NotFoundError, ValidationError
 
 
 DEFAULT_LEDGER_RELATIVE_PATH = Path(".experiments") / "ledger.sqlite"
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 
 
 def _parents_inclusive(path: Path) -> list[Path]:

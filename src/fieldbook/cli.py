@@ -10,6 +10,7 @@ from fieldbook.errors import ExitCode, FieldbookError, LedgerBusyError, NotFound
 from fieldbook.output import emit
 from fieldbook.repository import Repository, note_body_preview
 from fieldbook.reconcile import load_manifest, reconcile_log, reconcile_manifest
+from fieldbook.sql_query import DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_SQL_LIMIT, DEFAULT_SQL_TIMEOUT, execute_readonly_sql, resolve_sql_text
 from fieldbook.validation import NOTE_BODY_FORMATS, parse_attrs, validate_metric_value
 
 
@@ -57,6 +58,8 @@ def _is_read_only(args: argparse.Namespace) -> bool:
         return getattr(args, "reconcile_command", None) == "log" or (
             getattr(args, "reconcile_command", None) == "file" and not getattr(args, "apply", False)
         )
+    if command in {"db", "sql"}:
+        return True
     if command == "export":
         return getattr(args, "export_command", None) == "coverage" and not getattr(args, "output", None)
     return False
@@ -68,6 +71,37 @@ def _cmd_init(args: argparse.Namespace) -> int:
     init_ledger(ledger_path)
     payload = {"ledger": str(ledger_path), "existed": existed}
     emit(payload, json_output=args.json, text=f"{'existing' if existed else 'created'} Fieldbook ledger: {ledger_path}")
+    return ExitCode.SUCCESS
+
+
+def _cmd_db_path(args: argparse.Namespace) -> int:
+    ledger_path = discover_ledger(ledger=args.ledger)
+    emit({"path": str(ledger_path)}, json_output=args.json, text=str(ledger_path))
+    return ExitCode.SUCCESS
+
+
+def _cmd_sql(args: argparse.Namespace) -> int:
+    ledger_path = discover_ledger(ledger=args.ledger)
+    sql = resolve_sql_text(
+        query=args.query,
+        file=args.file,
+        stdin=args.stdin,
+        stdin_text=sys.stdin.read() if args.stdin else None,
+    )
+    stdout, stderr = execute_readonly_sql(
+        ledger_path=ledger_path,
+        sql=sql,
+        limit=args.limit,
+        no_limit=args.no_limit,
+        timeout=args.timeout,
+        max_output_bytes=args.max_output_bytes,
+        allow_blobs=args.allow_blobs,
+        output_format=args.format,
+    )
+    if stdout:
+        print(stdout, end="")
+    if stderr:
+        print(stderr, end="", file=sys.stderr)
     return ExitCode.SUCCESS
 
 
@@ -526,6 +560,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_note_parsers(subparsers)
     _add_reconcile_parsers(subparsers)
     _add_export_parsers(subparsers)
+    _add_db_parsers(subparsers)
+    _add_sql_parser(subparsers)
     return parser
 
 
@@ -790,6 +826,31 @@ def _add_reconcile_parsers(subparsers: argparse._SubParsersAction) -> None:
     log_parser.add_argument("--limit", type=int, default=20)
     log_parser.add_argument("--operations", action="store_true")
     log_parser.set_defaults(func=_repo_command(_reconcile_log))
+
+
+def _add_db_parsers(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("db", help="Inspect the Fieldbook database")
+    commands = parser.add_subparsers(dest="db_command", required=True)
+
+    path = commands.add_parser("path")
+    _add_common_options(path)
+    path.set_defaults(func=_cmd_db_path)
+
+
+def _add_sql_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("sql", help="Run safe read-only SQL")
+    _add_common_options(parser)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--query")
+    source.add_argument("--file")
+    source.add_argument("--stdin", action="store_true")
+    parser.add_argument("--format", choices=["json", "ndjson", "csv"], default="json")
+    parser.add_argument("--limit", type=int, default=DEFAULT_SQL_LIMIT)
+    parser.add_argument("--no-limit", action="store_true")
+    parser.add_argument("--timeout", type=float, default=DEFAULT_SQL_TIMEOUT)
+    parser.add_argument("--max-output-bytes", type=int, default=DEFAULT_MAX_OUTPUT_BYTES)
+    parser.add_argument("--allow-blobs", action="store_true")
+    parser.set_defaults(func=_cmd_sql)
 
 
 def _add_export_parsers(subparsers: argparse._SubParsersAction) -> None:

@@ -250,6 +250,27 @@ uv run fieldbook reconcile log --event "$RECONCILE_EVENT_ID" --json
 uv run fieldbook reconcile log --source "manual-eval-refresh" --operations --json
 ```
 
+Inspect the ledger through stable SQL views:
+
+```bash
+uv run fieldbook db path --json
+
+uv run fieldbook sql \
+  --query "SELECT run_id, metric_name, value FROM v_metrics_long_v1 WHERE metric_name = 'eval/uncheatable_eval/bpb'" \
+  --limit 100 \
+  --json
+```
+
+`fieldbook sql` is read-only and bounded. It rejects writes, DDL, PRAGMAs,
+`ATTACH`, extension loading, multiple statements, runaway queries, and
+oversized output. JSON output uses an envelope with `envelope_version`,
+`columns`, `rows`, `row_count`, and `truncated`. NDJSON and CSV are available
+with `--format ndjson|csv`.
+
+Use `v_*_v1` views as the public SQL contract. Tables are internal
+implementation details; future breaking query-contract changes should add
+`_v2` views instead of changing `_v1` columns.
+
 Export collaborator-ready tables:
 
 ```bash

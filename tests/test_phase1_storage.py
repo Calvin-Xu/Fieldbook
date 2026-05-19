@@ -283,7 +283,7 @@ def test_migration_blocks_duplicate_external_identifiers(tmp_path):
     conn = sqlite3.connect(ledger)
     try:
         conn.execute("BEGIN")
-        for version in range(1, CURRENT_SCHEMA_VERSION):
+        for version in range(1, 5):
             _execute_sql_script(conn, _migration_sql(version))
             conn.execute(f"PRAGMA user_version = {version}")
             conn.execute(

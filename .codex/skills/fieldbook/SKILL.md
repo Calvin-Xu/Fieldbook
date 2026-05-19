@@ -129,6 +129,23 @@ uv run fieldbook reconcile log --event "$RECONCILE_EVENT_ID" --json
 uv run fieldbook reconcile log --source iris-refresh --operations --json
 ```
 
+## Query The Ledger
+
+Use stable views for ad hoc analysis and dashboard prototypes:
+
+```bash
+uv run fieldbook db path --json
+uv run fieldbook sql --query "SELECT * FROM v_experiment_summary_v1" --limit 100 --json
+uv run fieldbook sql --file /tmp/query.sql --format csv > /tmp/results.csv
+```
+
+`fieldbook sql` is read-only and bounded. It rejects writes, DDL, PRAGMAs,
+`ATTACH`, extension loading, and multiple statements. Prefer explicit
+`--limit` values. Use `v_*_v1` views as the compatibility contract; avoid
+depending on internal table shapes unless the user explicitly asks for a local
+debug query. JSON output includes `envelope_version`, `columns`, `rows`,
+`row_count`, and `truncated`.
+
 ## Export Collaborator Tables
 
 ```bash

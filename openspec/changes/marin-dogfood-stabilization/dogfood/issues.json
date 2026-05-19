@@ -1,0 +1,19 @@
+{
+  "envelope_version": 1,
+  "items": [
+    {
+      "id": "global-ledger-option-ergonomics",
+      "title": "Make explicit-ledger invocation harder to misorder",
+      "evidence": "The first dogfood wrapper failed when it placed --ledger before the subcommand. Fieldbook currently defines --ledger on subcommands, not as a top-level option. This phase updated README and agent-skill guidance; accepting --ledger before the subcommand remains deferred.",
+      "proposed_shape": "Either document subcommand-scoped --ledger more prominently, or add a true global --ledger option accepted before the command.",
+      "disposition": "follow-on-spec"
+    },
+    {
+      "id": "dashboard-redaction-local-paths",
+      "title": "Dashboard needs a locality and redaction presentation layer",
+      "evidence": "Dogfood status and export payloads correctly included absolute local artifact paths under <LOCAL_LEDGER>. These are useful for agents but not suitable for shared dashboards.",
+      "proposed_shape": "Dashboard queries should classify artifact URI locality and render private local paths through redacted labels or path basenames unless an operator explicitly opts into full local paths.",
+      "disposition": "dashboard-prerequisite"
+    }
+  ]
+}

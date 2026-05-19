@@ -107,6 +107,16 @@ schema have been dogfooded.
 This quickstart is intentionally written as commands an agent can run in a
 temporary or real ML repo.
 
+From another repo without adding Fieldbook as a dependency, run Fieldbook from a
+sidecar checkout:
+
+```bash
+uv run --project <FIELDBOOK_CHECKOUT> fieldbook <command> ...
+```
+
+`--ledger` is command-scoped in the current CLI, so put it after the command,
+for example `fieldbook experiment list --ledger <path> --json`.
+
 ```bash
 uv run fieldbook init --json
 ```

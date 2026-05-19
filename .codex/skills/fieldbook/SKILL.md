@@ -30,6 +30,16 @@ If the repo has no Git root, this creates `.experiments/ledger.sqlite` under
 the current working directory. Use `--ledger` or `FIELDBOOK_LEDGER` only when
 the user wants an explicit non-default ledger.
 
+From a downstream repo that should not depend on Fieldbook, use a sidecar
+checkout instead of editing the downstream `pyproject.toml`:
+
+```bash
+uv run --project <FIELDBOOK_CHECKOUT> fieldbook <command> ...
+```
+
+The current CLI treats `--ledger` as command-scoped, so place it after the
+command or subcommand: `fieldbook experiment list --ledger <path> --json`.
+
 ## Context Switch Back To An Experiment
 
 ```bash

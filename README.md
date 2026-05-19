@@ -250,6 +250,32 @@ uv run fieldbook reconcile log --event "$RECONCILE_EVENT_ID" --json
 uv run fieldbook reconcile log --source "manual-eval-refresh" --operations --json
 ```
 
+Use adapters when external state has already been exported to local files.
+Adapters do not read or write the ledger. They translate snapshots into
+reconcile manifests, which an agent can inspect and then apply explicitly:
+
+```bash
+uv run fieldbook adapter list --json
+uv run fieldbook adapter describe iris-jobs-json --json
+
+uv run fieldbook adapter run iris-jobs-json \
+  --input /tmp/iris_jobs.json \
+  --output /tmp/iris_jobs_manifest.json \
+  --debug-output /tmp/iris_jobs_debug.json \
+  --json
+
+uv run fieldbook reconcile file \
+  --experiment "$EXP_ID" \
+  --path /tmp/iris_jobs_manifest.json \
+  --source "iris-jobs-refresh" \
+  --apply \
+  --json
+```
+
+Use `--strict` when a refresh should fail on any skipped input row. Adapter
+debug output contains unredacted source rows and should be treated as local
+diagnostic material.
+
 Inspect the ledger through stable SQL views:
 
 ```bash

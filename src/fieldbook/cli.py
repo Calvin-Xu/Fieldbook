@@ -2,9 +2,18 @@ import argparse
 import json
 import sqlite3
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
+from fieldbook.adapters import (
+    AdapterFailure,
+    describe_adapter,
+    list_adapters,
+    read_adapter_input,
+    run_adapter,
+    write_json_payload,
+)
 from fieldbook.db import connect, discover_ledger, init_ledger, resolve_init_path
 from fieldbook.errors import ExitCode, FieldbookError, LedgerBusyError, NotFoundError, ValidationError
 from fieldbook.output import emit
@@ -102,6 +111,37 @@ def _cmd_sql(args: argparse.Namespace) -> int:
         print(stdout, end="")
     if stderr:
         print(stderr, end="", file=sys.stderr)
+    return ExitCode.SUCCESS
+
+
+def _adapter_list(args: argparse.Namespace) -> int:
+    emit(list_adapters(), json_output=args.json)
+    return ExitCode.SUCCESS
+
+
+def _adapter_describe(args: argparse.Namespace) -> int:
+    emit(describe_adapter(args.adapter), json_output=args.json)
+    return ExitCode.SUCCESS
+
+
+def _adapter_run(args: argparse.Namespace) -> int:
+    if args.output == "-" and args.debug_output == "-":
+        raise ValidationError("--output - and --debug-output - cannot both write to stdout")
+    try:
+        text = read_adapter_input(args.input, stdin_text=sys.stdin.read() if args.input == "-" else None)
+        result = run_adapter(args.adapter, text, strict=args.strict)
+    except AdapterFailure as exc:
+        if args.debug_output:
+            write_json_payload(args.debug_output, exc.debug_payload)
+        print(f"fieldbook: {exc}", file=sys.stderr)
+        return exc.exit_code
+
+    if args.debug_output:
+        write_json_payload(args.debug_output, result.debug_payload())
+    write_json_payload(args.output, result.manifest)
+    if args.output == "-" or args.debug_output == "-":
+        return ExitCode.SUCCESS
+    emit(result.summary(output=args.output, debug_output=args.debug_output), json_output=args.json)
     return ExitCode.SUCCESS
 
 
@@ -560,9 +600,33 @@ def build_parser() -> argparse.ArgumentParser:
     _add_note_parsers(subparsers)
     _add_reconcile_parsers(subparsers)
     _add_export_parsers(subparsers)
+    _add_adapter_parsers(subparsers)
     _add_db_parsers(subparsers)
     _add_sql_parser(subparsers)
     return parser
+
+
+def _add_adapter_parsers(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("adapter", help="Transform refresh snapshots into reconcile manifests")
+    commands = parser.add_subparsers(dest="adapter_command", required=True)
+
+    list_parser = commands.add_parser("list")
+    _add_common_options(list_parser)
+    list_parser.set_defaults(func=_adapter_list)
+
+    describe = commands.add_parser("describe")
+    _add_common_options(describe)
+    describe.add_argument("adapter")
+    describe.set_defaults(func=_adapter_describe)
+
+    run = commands.add_parser("run")
+    _add_common_options(run)
+    run.add_argument("adapter")
+    run.add_argument("--input", required=True)
+    run.add_argument("--output", required=True)
+    run.add_argument("--debug-output")
+    run.add_argument("--strict", action="store_true")
+    run.set_defaults(func=_adapter_run)
 
 
 def _add_experiment_parsers(subparsers: argparse._SubParsersAction) -> None:

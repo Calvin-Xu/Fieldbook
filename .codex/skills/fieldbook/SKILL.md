@@ -129,6 +129,35 @@ uv run fieldbook reconcile log --event "$RECONCILE_EVENT_ID" --json
 uv run fieldbook reconcile log --source iris-refresh --operations --json
 ```
 
+Use adapters when the external system state is already available as a local
+snapshot. Adapters are pure translators: they never read or mutate the ledger.
+They produce reconcile manifests and optional debug files:
+
+```bash
+uv run fieldbook adapter list --json
+uv run fieldbook adapter describe wandb-runs-json --json
+uv run fieldbook adapter run wandb-runs-json \
+  --input /tmp/wandb_runs.json \
+  --output /tmp/wandb_runs_manifest.json \
+  --debug-output /tmp/wandb_runs_debug.json \
+  --json
+uv run fieldbook reconcile file \
+  --experiment "$EXP_ID" \
+  --path /tmp/wandb_runs_manifest.json \
+  --source wandb-refresh \
+  --apply \
+  --json
+```
+
+Run adapters with `--strict` when skipped rows should fail the refresh. Without
+`--strict`, partial coverage succeeds and skipped rows are recorded in the
+debug output. Treat adapter debug files as local-only diagnostics because they
+include unredacted source rows.
+
+Metric and artifact adapters require ledger IDs. If a snapshot only has
+external run IDs, first run and apply `wandb-runs-json`, query `v_runs_v1` for
+the ledger IDs, then produce the metric or artifact manifest.
+
 ## Query The Ledger
 
 Use stable views for ad hoc analysis and dashboard prototypes:

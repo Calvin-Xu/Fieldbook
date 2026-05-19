@@ -10,10 +10,13 @@ or export collaborator-ready data.
 - Use JSON output for agent workflows: pass `--json` on `list`, `show`,
   `status`, `create`, and `add` commands.
 - Record external systems as links and provenance, not as the source of truth.
-- Keep notes short and structured. Use `note_type=next-action` for work the
-  next agent should perform.
+- Keep notes concise but Markdown-structured. Use `note_type=handoff` for
+  blockers or resume context the next agent must see, `note_type=next-action`
+  for active work, `note_type=debug` for unresolved investigations, and
+  `note_type=research` / `note_type=decision` for durable context.
 - Do not dump the entire ledger into context. Start with one experiment's
-  `status`, then drill into specific runs, jobs, artifacts, metrics, or notes.
+  compact `status`, use `experiment context` when full handoff context is
+  needed, then drill into specific runs, jobs, artifacts, metrics, or notes.
 
 ## Initialize A Ledger
 
@@ -32,16 +35,19 @@ the user wants an explicit non-default ledger.
 ```bash
 uv run fieldbook experiment list --json
 uv run fieldbook experiment status "$EXP_ID" --json
+uv run fieldbook experiment context "$EXP_ID"
 ```
 
 Use the status payload to identify stale running jobs, failed jobs, key
-artifacts, unresolved next actions, and recent notes. Then inspect only the
-relevant entities:
+artifacts, open handoffs, open next actions, open debug notes, and recent
+research/decision previews. Use context for full Markdown note bodies. Then
+inspect only the relevant entities:
 
 ```bash
 uv run fieldbook job show "$JOB_ID" --json
 uv run fieldbook run show "$RUN_ID" --json
 uv run fieldbook note list --entity-type experiment --entity-id "$EXP_ID" --status open --json
+uv run fieldbook note show "$NOTE_ID" --json
 ```
 
 ## Record Work
@@ -69,6 +75,22 @@ Update status flexibly when the external system changes:
 ```bash
 uv run fieldbook job update-status "$JOB_ID" --status succeeded --json
 ```
+
+Record Markdown notes:
+
+```bash
+uv run fieldbook note add \
+  --entity-type experiment \
+  --entity-id "$EXP_ID" \
+  --type handoff \
+  --title "Blocked on eval retry" \
+  --body-file /tmp/fieldbook-handoff.md \
+  --json
+```
+
+Use `--body` for short one-line notes, `--body-file` for multiline Markdown,
+and `--body-stdin` when piping generated note content. Notes are capped; store
+large reports, logs, notebooks, dashboards, and CSVs as artifacts instead.
 
 ## Reconcile External State
 

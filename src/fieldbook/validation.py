@@ -24,7 +24,10 @@ ARTIFACT_TYPES = {
 }
 NOTE_TYPES = {"research", "debug", "handoff", "next-action", "decision"}
 NOTE_STATUSES = {"open", "resolved", "superseded"}
+NOTE_BODY_FORMATS = {"markdown", "plain"}
 ENTITY_TYPES = {"experiment", "run", "job", "artifact", "metric"}
+MAX_NOTE_TITLE_CHARS = 120
+MAX_NOTE_BODY_BYTES = 64 * 1024
 
 UTC_Z_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
 ATTR_KEY_RE = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$")
@@ -35,6 +38,28 @@ def require_choice(value: str, choices: set[str], label: str) -> str:
     if value not in choices:
         allowed = ", ".join(sorted(choices))
         raise ValidationError(f"invalid {label} {value!r}; expected one of: {allowed}")
+    return value
+
+
+def validate_note_title(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if not normalized:
+        raise ValidationError("note title must not be empty")
+    if len(normalized) > MAX_NOTE_TITLE_CHARS:
+        raise ValidationError(f"note title must be at most {MAX_NOTE_TITLE_CHARS} characters")
+    return normalized
+
+
+def validate_note_body(value: str) -> str:
+    if value == "":
+        raise ValidationError("note body must not be empty")
+    size = len(value.encode("utf-8"))
+    if size > MAX_NOTE_BODY_BYTES:
+        raise ValidationError(
+            f"note body is {size} bytes; store material over {MAX_NOTE_BODY_BYTES} bytes as an artifact"
+        )
     return value
 
 

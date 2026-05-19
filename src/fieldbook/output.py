@@ -42,7 +42,10 @@ def _format_value(value: Any) -> str:
         return ",".join(str(item) for item in value)
     if isinstance(value, dict):
         return json.dumps(value, sort_keys=True)
-    return str(value)
+    text = str(value).replace("\n", "\\n")
+    if len(text) > 100:
+        return text[:99] + "…"
+    return text
 
 
 def compact_count_rows(counts: Mapping[str, int]) -> list[dict[str, Any]]:

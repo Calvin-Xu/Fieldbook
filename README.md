@@ -160,7 +160,8 @@ uv run fieldbook metric add \
 uv run fieldbook note add \
   --entity-type experiment \
   --entity-id "$EXP_ID" \
-  --type next-action \
+  --type handoff \
+  --title "Refresh and export" \
   --body "Refresh job status and export collaborator table." \
   --json
 ```
@@ -169,6 +170,34 @@ Context-switch back to the experiment from any subdirectory:
 
 ```bash
 uv run fieldbook experiment status "$EXP_ID" --json
+uv run fieldbook experiment context "$EXP_ID"
+```
+
+`status` is the compact navigation surface for agents: counts, failed/stale
+jobs, key artifacts, and note previews. `context` is the LLM-ready Markdown
+handoff surface with full bodies for active handoff, next-action, and debug
+notes plus recent research and decision notes.
+
+For multiline Markdown notes, prefer a body file:
+
+```bash
+cat > /tmp/fieldbook-note.md <<'EOF'
+# Finding
+
+- Use `note_type=handoff` for blockers that the next agent must see.
+- Use `note_type=next-action` for active work.
+- Use `note_type=research` and `note_type=decision` for durable context.
+EOF
+
+uv run fieldbook note add \
+  --entity-type experiment \
+  --entity-id "$EXP_ID" \
+  --type research \
+  --title "Note conventions" \
+  --body-file /tmp/fieldbook-note.md \
+  --json
+
+uv run fieldbook note show "$NOTE_ID" --json
 ```
 
 Refresh from a file-based manifest:

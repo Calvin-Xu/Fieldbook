@@ -153,3 +153,77 @@ def test_metric_idempotency_treats_missing_optional_fields_as_equal(tmp_path):
             raise AssertionError("expected duplicate metric to violate idempotency index")
     finally:
         conn.close()
+
+
+def test_note_schema_has_markdown_metadata_defaults_and_constraints(tmp_path):
+    ledger = tmp_path / ".experiments" / "ledger.sqlite"
+    init_ledger(ledger)
+    conn = connect(ledger)
+    try:
+        conn.execute(
+            "INSERT INTO experiments (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            ("exp_test", "Test", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+        )
+        conn.execute(
+            "INSERT INTO notes (id, entity_type, entity_id, note_type, status, body, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "note_default",
+                "experiment",
+                "exp_test",
+                "research",
+                "open",
+                "Markdown body",
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+            ),
+        )
+        default_row = conn.execute(
+            "SELECT title, body_format FROM notes WHERE id = 'note_default'"
+        ).fetchone()
+        assert default_row["title"] is None
+        assert default_row["body_format"] == "markdown"
+
+        try:
+            conn.execute(
+                "INSERT INTO notes (id, entity_type, entity_id, note_type, status, body, body_format, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "note_invalid_format",
+                    "experiment",
+                    "exp_test",
+                    "research",
+                    "open",
+                    "Body",
+                    "html",
+                    "2026-01-01T00:00:00Z",
+                    "2026-01-01T00:00:00Z",
+                ),
+            )
+        except sqlite3.IntegrityError:
+            pass
+        else:
+            raise AssertionError("expected invalid body_format to violate note schema constraint")
+
+        try:
+            conn.execute(
+                "INSERT INTO notes (id, entity_type, entity_id, note_type, status, title, body, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "note_long_title",
+                    "experiment",
+                    "exp_test",
+                    "research",
+                    "open",
+                    "x" * 121,
+                    "Body",
+                    "2026-01-01T00:00:00Z",
+                    "2026-01-01T00:00:00Z",
+                ),
+            )
+        except sqlite3.IntegrityError:
+            pass
+        else:
+            raise AssertionError("expected overlong title to violate note schema constraint")
+    finally:
+        conn.close()

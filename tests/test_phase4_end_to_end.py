@@ -115,9 +115,11 @@ def test_agent_end_to_end_flow_from_subdirectory(tmp_path):
         "--entity-id",
         experiment["id"],
         "--type",
-        "next-action",
+        "handoff",
+        "--title",
+        "Follow-up evals",
         "--body",
-        "Collect follow-up evals.",
+        "Collect follow-up evals.\n\nUse the exported metric table.",
         "--json",
     )
 
@@ -162,4 +164,8 @@ def test_agent_end_to_end_flow_from_subdirectory(tmp_path):
     status = payload(run_fieldbook(subdir, "experiment", "status", experiment["id"], "--json"))
     assert status["run_count"] == 2
     assert status["job_counts"] == {"running": 1, "succeeded": 1}
-    assert status["next_actions"][0]["body"] == "Collect follow-up evals."
+    assert status["notes"]["open_handoffs"][0]["title"] == "Follow-up evals"
+    assert status["notes"]["open_handoffs"][0]["body_preview"] == "Collect follow-up evals."
+
+    context = payload(run_fieldbook(subdir, "experiment", "context", experiment["id"], "--json"))
+    assert context["notes"]["open_handoffs"][0]["body"] == "Collect follow-up evals.\n\nUse the exported metric table."

@@ -1,8 +1,11 @@
 import json
 import sqlite3
 import csv
+import subprocess
+import sys
 from pathlib import Path
 
+from fieldbook.db import CURRENT_SCHEMA_VERSION, _execute_sql_script, _migration_sql
 from tests.test_phase2_cli import create_experiment, create_run, init_ledger, payload, run_fieldbook
 
 
@@ -65,7 +68,116 @@ def test_status_reports_stale_failed_artifacts_and_next_actions(tmp_path):
     assert [job["id"] for job in status["stale_jobs"]] == [running["id"]]
     assert [job["id"] for job in status["failed_jobs"]] == [failed["id"]]
     assert {item["id"] for item in status["key_artifacts"]} == {artifact["id"], run_artifact["id"]}
-    assert [item["id"] for item in status["next_actions"]] == [note["id"]]
+    assert [item["id"] for item in status["notes"]["open_next_actions"]] == [note["id"]]
+
+
+def test_status_and_context_categorize_notes_without_shredding_markdown(tmp_path):
+    ledger = init_ledger(tmp_path)
+    experiment_id = create_experiment(ledger)
+    handoff = payload(
+        run_fieldbook(
+            ledger,
+            "note",
+            "add",
+            "--entity-type",
+            "experiment",
+            "--entity-id",
+            experiment_id,
+            "--type",
+            "handoff",
+            "--title",
+            "Blocked",
+            "--body",
+            "Blocked on data.\n\n- Need token counts",
+        )
+    )
+    next_action = payload(
+        run_fieldbook(
+            ledger,
+            "note",
+            "add",
+            "--entity-type",
+            "experiment",
+            "--entity-id",
+            experiment_id,
+            "--type",
+            "next-action",
+            "--body",
+            "Run the next step.\n\nDetails should not appear in status.",
+        )
+    )
+    debug = payload(
+        run_fieldbook(
+            ledger,
+            "note",
+            "add",
+            "--entity-type",
+            "experiment",
+            "--entity-id",
+            experiment_id,
+            "--type",
+            "debug",
+            "--body",
+            "Investigate failure",
+        )
+    )
+    research = payload(
+        run_fieldbook(
+            ledger,
+            "note",
+            "add",
+            "--entity-type",
+            "experiment",
+            "--entity-id",
+            experiment_id,
+            "--type",
+            "research",
+            "--body",
+            "Long-lived finding",
+        )
+    )
+    decision = payload(
+        run_fieldbook(
+            ledger,
+            "note",
+            "add",
+            "--entity-type",
+            "experiment",
+            "--entity-id",
+            experiment_id,
+            "--type",
+            "decision",
+            "--body",
+            "Use Markdown notes",
+        )
+    )
+    run_fieldbook(ledger, "note", "resolve", research["id"])
+
+    status = payload(run_fieldbook(ledger, "experiment", "status", experiment_id))
+    assert [row["id"] for row in status["notes"]["open_handoffs"]] == [handoff["id"]]
+    assert [row["id"] for row in status["notes"]["open_next_actions"]] == [next_action["id"]]
+    assert [row["id"] for row in status["notes"]["open_debug"]] == [debug["id"]]
+    assert [row["id"] for row in status["notes"]["recent_research"]] == [research["id"]]
+    assert [row["id"] for row in status["notes"]["recent_decisions"]] == [decision["id"]]
+    assert status["notes"]["open_handoffs"][0]["body_preview"] == "Blocked on data."
+    assert "body" not in status["notes"]["open_handoffs"][0]
+    assert status["note_counts"]["handoff"]["open"] == 1
+    assert status["note_counts"]["research"]["resolved"] == 1
+
+    context = payload(run_fieldbook(ledger, "experiment", "context", experiment_id))
+    assert context["notes"]["open_handoffs"][0]["body"] == handoff["body"]
+    assert context["notes"]["open_next_actions"][0]["body"] == next_action["body"]
+    assert context["notes"]["recent_research"][0]["body"] == research["body"]
+
+    text_context = subprocess.run(
+        [sys.executable, "-m", "fieldbook", "experiment", "context", experiment_id, "--ledger", str(ledger)],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert "# Fieldbook Context:" in text_context.stdout
+    assert "## Open Handoffs" in text_context.stdout
+    assert "Blocked on data.\n\n- Need token counts" in text_context.stdout
 
 
 def test_reconcile_file_dry_run_apply_and_atomic_failure(tmp_path):
@@ -108,6 +220,8 @@ def test_reconcile_file_dry_run_apply_and_atomic_failure(tmp_path):
                         "entity_type": "run",
                         "entity_id": "run_manifest",
                         "note_type": "research",
+                        "title": "Manifest note",
+                        "body_format": "plain",
                         "body": "Imported from manifest",
                     }
                 ],
@@ -163,6 +277,9 @@ def test_reconcile_file_dry_run_apply_and_atomic_failure(tmp_path):
     assert applied["apply"] is True
     assert payload(run_fieldbook(ledger, "run", "show", "run_manifest"))["name"] == "manifest-run"
     assert payload(run_fieldbook(ledger, "experiment", "show", experiment_id))["attrs"]["marin.issue"] == 5416
+    manifest_note = payload(run_fieldbook(ledger, "note", "show", "note_manifest"))
+    assert manifest_note["title"] == "Manifest note"
+    assert manifest_note["body_format"] == "plain"
 
     bad_manifest = tmp_path / "bad.json"
     bad_manifest.write_text(
@@ -187,6 +304,128 @@ def test_reconcile_file_dry_run_apply_and_atomic_failure(tmp_path):
     assert failed.returncode != 0
     missing = run_fieldbook(ledger, "run", "show", "run_bad", check=False)
     assert missing.returncode != 0
+
+
+def test_reconcile_note_defaults_and_body_validation(tmp_path):
+    ledger = init_ledger(tmp_path)
+    experiment_id = create_experiment(ledger)
+    manifest_path = tmp_path / "legacy_notes.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "notes": [
+                    {
+                        "id": "note_legacy",
+                        "entity_type": "experiment",
+                        "entity_id": experiment_id,
+                        "note_type": "research",
+                        "body": "Legacy note",
+                    }
+                ]
+            }
+        )
+    )
+    run_fieldbook(
+        ledger,
+        "reconcile",
+        "file",
+        "--path",
+        str(manifest_path),
+        "--experiment",
+        experiment_id,
+        "--apply",
+    )
+    legacy_note = payload(run_fieldbook(ledger, "note", "show", "note_legacy"))
+    assert legacy_note["title"] is None
+    assert legacy_note["body_format"] == "markdown"
+
+    plain_manifest = tmp_path / "plain_note.json"
+    plain_manifest.write_text(
+        json.dumps(
+            {
+                "notes": [
+                    {
+                        "id": "note_plain",
+                        "entity_type": "experiment",
+                        "entity_id": experiment_id,
+                        "note_type": "research",
+                        "body_format": "plain",
+                        "body": "Initial plain note",
+                    }
+                ]
+            }
+        )
+    )
+    run_fieldbook(
+        ledger,
+        "reconcile",
+        "file",
+        "--path",
+        str(plain_manifest),
+        "--experiment",
+        experiment_id,
+        "--apply",
+    )
+    assert payload(run_fieldbook(ledger, "note", "show", "note_plain"))["body_format"] == "plain"
+
+    update_manifest = tmp_path / "plain_note_update.json"
+    update_manifest.write_text(
+        json.dumps(
+            {
+                "notes": [
+                    {
+                        "id": "note_plain",
+                        "entity_type": "experiment",
+                        "entity_id": experiment_id,
+                        "note_type": "research",
+                        "body": "Updated plain note",
+                    }
+                ]
+            }
+        )
+    )
+    run_fieldbook(
+        ledger,
+        "reconcile",
+        "file",
+        "--path",
+        str(update_manifest),
+        "--experiment",
+        experiment_id,
+        "--apply",
+    )
+    updated_plain = payload(run_fieldbook(ledger, "note", "show", "note_plain"))
+    assert updated_plain["body"] == "Updated plain note"
+    assert updated_plain["body_format"] == "plain"
+
+    bad_manifest = tmp_path / "bad_note.json"
+    bad_manifest.write_text(
+        json.dumps(
+            {
+                "notes": [
+                    {
+                        "id": "note_bad",
+                        "entity_type": "experiment",
+                        "entity_id": experiment_id,
+                        "note_type": "research",
+                        "body": "",
+                    }
+                ]
+            }
+        )
+    )
+    failed = run_fieldbook(
+        ledger,
+        "reconcile",
+        "file",
+        "--path",
+        str(bad_manifest),
+        "--experiment",
+        experiment_id,
+        "--apply",
+        check=False,
+    )
+    assert failed.returncode != 0
 
 
 def test_metric_exports_and_coverage_record_artifacts(tmp_path):
@@ -401,10 +640,19 @@ def test_artifact_uri_collision_requires_update_existing(tmp_path):
 
 
 def test_non_init_commands_apply_pending_migrations(tmp_path):
-    ledger = init_ledger(tmp_path)
+    ledger = tmp_path / "ledger.sqlite"
+    ledger.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(ledger)
     try:
-        conn.execute("PRAGMA user_version = 2")
+        conn.execute("BEGIN")
+        for version in range(1, CURRENT_SCHEMA_VERSION):
+            _execute_sql_script(conn, _migration_sql(version))
+            conn.execute(f"PRAGMA user_version = {version}")
+            conn.execute(
+                "INSERT OR REPLACE INTO schema_metadata (key, value, updated_at) "
+                "VALUES ('schema_version', ?, datetime('now'))",
+                (str(version),),
+            )
         conn.commit()
     finally:
         conn.close()
@@ -414,7 +662,7 @@ def test_non_init_commands_apply_pending_migrations(tmp_path):
 
     conn = sqlite3.connect(ledger)
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
     finally:
         conn.close()
 

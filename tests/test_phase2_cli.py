@@ -7,10 +7,16 @@ from pathlib import Path
 from fieldbook.errors import ExitCode
 
 
-def run_fieldbook(ledger: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+def run_fieldbook(
+    ledger: Path,
+    *args: str,
+    check: bool = True,
+    input_text: str | None = None,
+) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
         [sys.executable, "-m", "fieldbook", *args, "--ledger", str(ledger), "--json"],
         text=True,
+        input=input_text,
         capture_output=True,
         check=False,
     )
@@ -128,14 +134,164 @@ def test_experiment_run_job_note_status_flow(tmp_path):
         )
     )
     assert note["status"] == "open"
+    assert note["body_format"] == "markdown"
+    assert note["title"] is None
 
     status = payload(run_fieldbook(ledger, "experiment", "status", experiment_id))
     assert status["run_count"] == 1
     assert status["job_counts"] == {"running": 1}
-    assert status["open_note_count"] == 1
+    assert [item["id"] for item in status["notes"]["open_next_actions"]] == [note["id"]]
 
     resolved = payload(run_fieldbook(ledger, "note", "resolve", note["id"]))
     assert resolved["status"] == "resolved"
+
+
+def test_markdown_note_add_list_show_and_body_sources(tmp_path):
+    ledger = init_ledger(tmp_path)
+    experiment_id = create_experiment(ledger)
+    body_file = tmp_path / "note.md"
+    body_file.write_text("# Finding\n\nUse `$x_i$` in the design.\n", encoding="utf-8")
+
+    note = payload(
+        run_fieldbook(
+            ledger,
+            "note",
+            "add",
+            "--entity-type",
+            "experiment",
+            "--entity-id",
+            experiment_id,
+            "--type",
+            "research",
+            "--title",
+            "DSP finding",
+            "--body-file",
+            str(body_file),
+        )
+    )
+    assert note["title"] == "DSP finding"
+    assert note["body_format"] == "markdown"
+    assert note["body"] == "# Finding\n\nUse `$x_i$` in the design.\n"
+
+    stdin_note = payload(
+        run_fieldbook(
+            ledger,
+            "note",
+            "add",
+            "--entity-type",
+            "experiment",
+            "--entity-id",
+            experiment_id,
+            "--type",
+            "debug",
+            "--body-stdin",
+            "--body-format",
+            "plain",
+            input_text="plain debug body",
+        )
+    )
+    assert stdin_note["body_format"] == "plain"
+    assert stdin_note["body"] == "plain debug body"
+
+    compact_notes = payload(run_fieldbook(ledger, "note", "list", "--entity-type", "experiment", "--entity-id", experiment_id))
+    compact = {row["id"]: row for row in compact_notes}
+    assert compact[note["id"]]["title"] == "DSP finding"
+    assert compact[note["id"]]["body_preview"] == "# Finding"
+    assert "body" not in compact[note["id"]]
+
+    shown = payload(run_fieldbook(ledger, "note", "show", note["id"]))
+    assert shown["body"] == note["body"]
+    assert shown["title"] == "DSP finding"
+
+
+def test_note_body_validation_errors(tmp_path):
+    ledger = init_ledger(tmp_path)
+    experiment_id = create_experiment(ledger)
+
+    missing_body = run_fieldbook(
+        ledger,
+        "note",
+        "add",
+        "--entity-type",
+        "experiment",
+        "--entity-id",
+        experiment_id,
+        "--type",
+        "research",
+        check=False,
+    )
+    assert missing_body.returncode == ExitCode.VALIDATION_ERROR
+
+    double_body = run_fieldbook(
+        ledger,
+        "note",
+        "add",
+        "--entity-type",
+        "experiment",
+        "--entity-id",
+        experiment_id,
+        "--type",
+        "research",
+        "--body",
+        "short",
+        "--body-stdin",
+        input_text="stdin",
+        check=False,
+    )
+    assert double_body.returncode == ExitCode.VALIDATION_ERROR
+
+    empty_body = run_fieldbook(
+        ledger,
+        "note",
+        "add",
+        "--entity-type",
+        "experiment",
+        "--entity-id",
+        experiment_id,
+        "--type",
+        "research",
+        "--body",
+        "",
+        check=False,
+    )
+    assert empty_body.returncode == ExitCode.VALIDATION_ERROR
+
+    oversized = tmp_path / "oversized.md"
+    oversized.write_text("x" * 65537, encoding="utf-8")
+    oversized_result = run_fieldbook(
+        ledger,
+        "note",
+        "add",
+        "--entity-type",
+        "experiment",
+        "--entity-id",
+        experiment_id,
+        "--type",
+        "research",
+        "--body-file",
+        str(oversized),
+        check=False,
+    )
+    assert oversized_result.returncode == ExitCode.VALIDATION_ERROR
+    assert "artifact" in oversized_result.stderr.lower()
+
+    invalid_title = run_fieldbook(
+        ledger,
+        "note",
+        "add",
+        "--entity-type",
+        "experiment",
+        "--entity-id",
+        experiment_id,
+        "--type",
+        "research",
+        "--title",
+        "x" * 121,
+        "--body",
+        "body",
+        check=False,
+    )
+    assert invalid_title.returncode == ExitCode.VALIDATION_ERROR
 
 
 def test_list_show_link_archive_and_tags(tmp_path):

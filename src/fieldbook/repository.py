@@ -15,6 +15,7 @@ from fieldbook.validation import (
     EXPERIMENT_STATUSES,
     JOB_STATUSES,
     NOTE_STATUSES,
+    NOTE_BODY_FORMATS,
     NOTE_TYPES,
     RUN_STATUSES,
     attrs_json,
@@ -22,10 +23,19 @@ from fieldbook.validation import (
     load_attrs,
     normalize_tag,
     require_choice,
-        validate_content_hash,
-        validate_metric_value,
-        validate_utc_z,
+    validate_content_hash,
+    validate_metric_value,
+    validate_note_body,
+    validate_note_title,
+    validate_utc_z,
 )
+
+
+STATUS_NOTE_LIMIT = 10
+STATUS_RECENT_NOTE_LIMIT = 5
+CONTEXT_ACTIVE_NOTE_LIMIT = 20
+CONTEXT_RECENT_NOTE_LIMIT = 5
+NOTE_PREVIEW_CHARS = 200
 
 
 class Repository:
@@ -96,11 +106,6 @@ class Repository:
                 (experiment_id,),
             ).fetchall()
         )
-        open_notes = self.conn.execute(
-            "SELECT COUNT(*) FROM notes WHERE entity_type = 'experiment' AND entity_id = ? "
-            "AND status = 'open' AND deleted_at IS NULL",
-            (experiment_id,),
-        ).fetchone()[0]
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=stale_hours)).isoformat().replace("+00:00", "Z")
         stale_rows = self.conn.execute(
             "SELECT * FROM jobs WHERE experiment_id = ? AND status IN ('queued', 'running') "
@@ -113,29 +118,69 @@ class Repository:
             (experiment_id,),
         ).fetchall()
         artifact_rows = self._experiment_artifact_rows(experiment_id, limit=20)
-        next_actions = self.conn.execute(
-            "SELECT * FROM notes WHERE entity_type = 'experiment' AND entity_id = ? "
-            "AND note_type = 'next-action' AND status = 'open' AND deleted_at IS NULL "
-            "ORDER BY updated_at DESC LIMIT 10",
-            (experiment_id,),
-        ).fetchall()
-        recent_notes = self.conn.execute(
-            "SELECT * FROM notes WHERE entity_type = 'experiment' AND entity_id = ? "
-            "AND deleted_at IS NULL ORDER BY updated_at DESC LIMIT 10",
-            (experiment_id,),
-        ).fetchall()
         return {
             "experiment": experiment,
             "run_count": run_count,
             "job_counts": job_counts,
-            "open_note_count": open_notes,
+            "note_counts": self._experiment_note_counts(experiment_id),
+            "notes": self._experiment_compact_notes(experiment_id),
             "stale_threshold_hours": stale_hours,
             "stale_jobs": [self._job_dict(row) for row in stale_rows],
             "failed_jobs": [self._job_dict(row) for row in failed_rows],
             "key_artifacts": [self._artifact_dict(row) for row in artifact_rows],
-            "next_actions": [self._note_dict(row) for row in next_actions],
-            "recent_notes": [self._note_dict(row) for row in recent_notes],
         }
+
+    def experiment_context(self, ref: str, *, stale_hours: float = 24.0) -> dict[str, Any]:
+        status = self.experiment_status(ref, stale_hours=stale_hours)
+        experiment_id = status["experiment"]["id"]
+        status["notes"] = {
+            "open_handoffs": [
+                self._note_dict(row)
+                for row in self._note_rows(
+                    experiment_id,
+                    note_type="handoff",
+                    status="open",
+                    limit=CONTEXT_ACTIVE_NOTE_LIMIT,
+                )
+            ],
+            "open_next_actions": [
+                self._note_dict(row)
+                for row in self._note_rows(
+                    experiment_id,
+                    note_type="next-action",
+                    status="open",
+                    limit=CONTEXT_ACTIVE_NOTE_LIMIT,
+                )
+            ],
+            "open_debug": [
+                self._note_dict(row)
+                for row in self._note_rows(
+                    experiment_id,
+                    note_type="debug",
+                    status="open",
+                    limit=CONTEXT_ACTIVE_NOTE_LIMIT,
+                )
+            ],
+            "recent_research": [
+                self._note_dict(row)
+                for row in self._note_rows(
+                    experiment_id,
+                    note_type="research",
+                    status=None,
+                    limit=CONTEXT_RECENT_NOTE_LIMIT,
+                )
+            ],
+            "recent_decisions": [
+                self._note_dict(row)
+                for row in self._note_rows(
+                    experiment_id,
+                    note_type="decision",
+                    status=None,
+                    limit=CONTEXT_RECENT_NOTE_LIMIT,
+                )
+            ],
+        }
+        return status
 
     def add_run(
         self,
@@ -717,21 +762,39 @@ class Repository:
         entity_ref: str,
         note_type: str,
         status: str,
+        title: str | None,
         body: str,
+        body_format: str,
         author: str | None,
         attrs: dict[str, Any],
     ) -> dict[str, Any]:
         require_choice(entity_type, ENTITY_TYPES, "entity type")
         require_choice(note_type, NOTE_TYPES, "note type")
         require_choice(status, NOTE_STATUSES, "note status")
+        require_choice(body_format, NOTE_BODY_FORMATS, "note body format")
+        title = validate_note_title(title)
+        body = validate_note_body(body)
         entity_id = self._resolve_entity_id(entity_type, entity_ref)
         now = utc_now()
         note_id = new_id("note")
         with self.conn:
             self.conn.execute(
-                "INSERT INTO notes (id, entity_type, entity_id, note_type, status, body, author, created_at, "
-                "updated_at, attrs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (note_id, entity_type, entity_id, note_type, status, body, author, now, now, attrs_json(attrs)),
+                "INSERT INTO notes (id, entity_type, entity_id, note_type, status, title, body, body_format, "
+                "author, created_at, updated_at, attrs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    note_id,
+                    entity_type,
+                    entity_id,
+                    note_type,
+                    status,
+                    title,
+                    body,
+                    body_format,
+                    author,
+                    now,
+                    now,
+                    attrs_json(attrs),
+                ),
             )
         return self.get_note(note_id)
 
@@ -803,6 +866,87 @@ class Repository:
             "ORDER BY a.updated_at DESC LIMIT ?",
             (experiment_id, experiment_id, experiment_id, experiment_id, limit),
         ).fetchall()
+
+    def _experiment_note_counts(self, experiment_id: str) -> dict[str, dict[str, int]]:
+        counts = {note_type: {status: 0 for status in sorted(NOTE_STATUSES)} for note_type in sorted(NOTE_TYPES)}
+        rows = self.conn.execute(
+            "SELECT note_type, status, COUNT(*) AS count FROM notes "
+            "WHERE entity_type = 'experiment' AND entity_id = ? AND deleted_at IS NULL "
+            "GROUP BY note_type, status",
+            (experiment_id,),
+        ).fetchall()
+        for row in rows:
+            counts[row["note_type"]][row["status"]] = int(row["count"])
+        return counts
+
+    def _experiment_compact_notes(self, experiment_id: str) -> dict[str, list[dict[str, Any]]]:
+        return {
+            "open_handoffs": [
+                self._compact_note_dict(row)
+                for row in self._note_rows(
+                    experiment_id,
+                    note_type="handoff",
+                    status="open",
+                    limit=STATUS_NOTE_LIMIT,
+                )
+            ],
+            "open_next_actions": [
+                self._compact_note_dict(row)
+                for row in self._note_rows(
+                    experiment_id,
+                    note_type="next-action",
+                    status="open",
+                    limit=STATUS_NOTE_LIMIT,
+                )
+            ],
+            "open_debug": [
+                self._compact_note_dict(row)
+                for row in self._note_rows(
+                    experiment_id,
+                    note_type="debug",
+                    status="open",
+                    limit=STATUS_NOTE_LIMIT,
+                )
+            ],
+            "recent_research": [
+                self._compact_note_dict(row)
+                for row in self._note_rows(
+                    experiment_id,
+                    note_type="research",
+                    status=None,
+                    limit=STATUS_RECENT_NOTE_LIMIT,
+                )
+            ],
+            "recent_decisions": [
+                self._compact_note_dict(row)
+                for row in self._note_rows(
+                    experiment_id,
+                    note_type="decision",
+                    status=None,
+                    limit=STATUS_RECENT_NOTE_LIMIT,
+                )
+            ],
+        }
+
+    def _note_rows(
+        self,
+        experiment_id: str,
+        *,
+        note_type: str,
+        status: str | None,
+        limit: int,
+    ) -> list[sqlite3.Row]:
+        params: list[Any] = [experiment_id, note_type]
+        query = (
+            "SELECT * FROM notes WHERE entity_type = 'experiment' AND entity_id = ? "
+            "AND note_type = ? AND deleted_at IS NULL"
+        )
+        if status is not None:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY updated_at DESC, id LIMIT ?"
+        params.append(limit)
+        return self.conn.execute(query, params).fetchall()
 
     def _upsert_metric(
         self,
@@ -899,6 +1043,7 @@ class Repository:
             "job": "jobs",
             "artifact": "artifacts",
             "metric": "metrics",
+            "note": "notes",
         }[entity_type]
         name_column = "name" if entity_type in {"experiment", "run", "job"} else None
         return self._resolve_row(table, ref, name_column=name_column)["id"]
@@ -955,6 +1100,19 @@ class Repository:
         data["attrs"] = load_attrs(data.pop("attrs_json", "{}"))
         return data
 
+    def _compact_note_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        full = self._note_dict(row)
+        return {
+            "id": full["id"],
+            "entity_type": full["entity_type"],
+            "entity_id": full["entity_id"],
+            "note_type": full["note_type"],
+            "status": full["status"],
+            "title": full["title"],
+            "body_format": full["body_format"],
+            "body_preview": note_body_preview(full["body"]),
+            "updated_at": full["updated_at"],
+        }
     def _metric_export_rows(self, experiment_id: str, metric_names: list[str] | None) -> list[dict[str, Any]]:
         params: list[Any] = [experiment_id]
         query = (
@@ -984,3 +1142,13 @@ class Repository:
         if row.get("split"):
             pieces.append(f"split={row['split']}")
         return "|".join(pieces)
+
+
+def note_body_preview(body: str) -> str:
+    for line in body.strip().splitlines():
+        normalized = line.strip()
+        if normalized:
+            if len(normalized) > NOTE_PREVIEW_CHARS:
+                return normalized[: NOTE_PREVIEW_CHARS - 1] + "…"
+            return normalized
+    return ""

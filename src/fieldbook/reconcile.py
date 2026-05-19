@@ -14,11 +14,14 @@ from fieldbook.validation import (
     ENTITY_TYPES,
     JOB_STATUSES,
     NOTE_STATUSES,
+    NOTE_BODY_FORMATS,
     NOTE_TYPES,
     RUN_STATUSES,
     attrs_json,
     load_attrs,
     require_choice,
+    validate_note_body,
+    validate_note_title,
     validate_content_hash,
     validate_attrs_dict,
     validate_metric_value,
@@ -231,9 +234,20 @@ def _plan_note(conn: sqlite3.Connection, row: dict[str, Any]) -> dict[str, Any]:
     require_choice(row["entity_type"], ENTITY_TYPES, "entity type")
     require_choice(row["note_type"], NOTE_TYPES, "note type")
     require_choice(row.get("status", "open"), NOTE_STATUSES, "note status")
+    title = validate_note_title(row.get("title"))
+    body = validate_note_body(row["body"]) if "body" in row else None
     existing = _find_entity(conn, "notes", row)
+    if existing is None and body is None:
+        raise ValidationError("note reconcile rows require body")
     note_id = existing["id"] if existing else row.get("id", new_id("note"))
-    return {"entity": "notes", "action": "update" if existing else "insert", "id": note_id, "row": {**row, "id": note_id}}
+    planned = {**row, "id": note_id, "title": title}
+    if body is not None:
+        planned["body"] = body
+    if "body_format" in row:
+        planned["body_format"] = require_choice(row["body_format"], NOTE_BODY_FORMATS, "note body format")
+    elif existing is None:
+        planned["body_format"] = "markdown"
+    return {"entity": "notes", "action": "update" if existing else "insert", "id": note_id, "row": planned}
 
 
 def _plan_custom_attrs(conn: sqlite3.Connection, row: dict[str, Any]) -> dict[str, Any]:
@@ -455,15 +469,17 @@ def _apply_note(conn: sqlite3.Connection, operation: dict[str, Any]) -> None:
     now = utc_now()
     if operation["action"] == "insert":
         conn.execute(
-            "INSERT INTO notes (id, entity_type, entity_id, note_type, status, body, author, created_at, updated_at, attrs_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO notes (id, entity_type, entity_id, note_type, status, title, body, body_format, author, "
+            "created_at, updated_at, attrs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 row["id"],
                 row["entity_type"],
                 row["entity_id"],
                 row["note_type"],
                 row.get("status", "open"),
+                row.get("title"),
                 row["body"],
+                row.get("body_format", "markdown"),
                 row.get("author"),
                 now,
                 now,
@@ -472,9 +488,19 @@ def _apply_note(conn: sqlite3.Connection, operation: dict[str, Any]) -> None:
         )
     else:
         conn.execute(
-            "UPDATE notes SET status = COALESCE(?, status), body = COALESCE(?, body), author = COALESCE(?, author), "
+            "UPDATE notes SET status = COALESCE(?, status), title = COALESCE(?, title), "
+            "body = COALESCE(?, body), body_format = COALESCE(?, body_format), author = COALESCE(?, author), "
             "attrs_json = ?, updated_at = ? WHERE id = ?",
-            (row.get("status"), row.get("body"), row.get("author"), attrs_json(row.get("attrs", {})), now, row["id"]),
+            (
+                row.get("status"),
+                row.get("title"),
+                row.get("body"),
+                row.get("body_format"),
+                row.get("author"),
+                attrs_json(row.get("attrs", {})),
+                now,
+                row["id"],
+            ),
         )
 
 

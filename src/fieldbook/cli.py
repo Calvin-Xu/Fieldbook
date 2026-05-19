@@ -8,9 +8,9 @@ from typing import Any, Callable
 from fieldbook.db import connect, discover_ledger, init_ledger, resolve_init_path
 from fieldbook.errors import ExitCode, FieldbookError, LedgerBusyError, NotFoundError, ValidationError
 from fieldbook.output import emit
-from fieldbook.repository import Repository
+from fieldbook.repository import Repository, note_body_preview
 from fieldbook.reconcile import load_manifest, reconcile_manifest
-from fieldbook.validation import parse_attrs, validate_metric_value
+from fieldbook.validation import NOTE_BODY_FORMATS, parse_attrs, validate_metric_value
 
 
 Command = Callable[[argparse.Namespace, Repository], Any]
@@ -42,7 +42,7 @@ def _with_repo(args: argparse.Namespace, command: Command) -> int:
 def _is_read_only(args: argparse.Namespace) -> bool:
     command = getattr(args, "command", None)
     if command == "experiment":
-        return getattr(args, "experiment_command", None) in {"list", "show", "status"}
+        return getattr(args, "experiment_command", None) in {"list", "show", "status", "context"}
     if command == "run":
         return getattr(args, "run_command", None) in {"list", "show"}
     if command == "job":
@@ -52,7 +52,7 @@ def _is_read_only(args: argparse.Namespace) -> bool:
     if command == "metric":
         return getattr(args, "metric_command", None) == "list"
     if command == "note":
-        return getattr(args, "note_command", None) == "list"
+        return getattr(args, "note_command", None) in {"list", "show"}
     if command == "reconcile":
         return getattr(args, "reconcile_command", None) == "file" and not getattr(args, "apply", False)
     if command == "export":
@@ -89,6 +89,13 @@ def _experiment_show(args: argparse.Namespace, repo: Repository) -> dict[str, An
 
 def _experiment_status(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
     return repo.experiment_status(args.experiment, stale_hours=args.stale_hours)
+
+
+def _experiment_context(args: argparse.Namespace, repo: Repository) -> dict[str, Any] | str:
+    context = repo.experiment_context(args.experiment, stale_hours=args.stale_hours)
+    if args.json:
+        return context
+    return _format_experiment_context_markdown(context)
 
 
 def _experiment_archive(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
@@ -233,12 +240,15 @@ def _metric_archive(args: argparse.Namespace, repo: Repository) -> dict[str, Any
 
 
 def _note_add(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    body = _resolve_note_body(args)
     return repo.add_note(
         entity_type=args.entity_type,
         entity_ref=args.entity_id,
         note_type=args.type,
         status=args.status,
-        body=args.body,
+        title=args.title,
+        body=body,
+        body_format=args.body_format,
         author=args.author,
         attrs=parse_attrs(args.attr),
     )
@@ -257,6 +267,13 @@ def _note_list(args: argparse.Namespace, repo: Repository) -> list[dict[str, Any
 
 def _note_resolve(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
     return repo.resolve_note(args.note)
+
+
+def _note_show(args: argparse.Namespace, repo: Repository) -> dict[str, Any] | str:
+    note = repo.get_note(args.note)
+    if args.json:
+        return note
+    return _format_note_markdown(note)
 
 
 def _note_archive(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
@@ -357,9 +374,106 @@ def _compact_note(row: dict[str, Any]) -> dict[str, Any]:
         "entity_id": row["entity_id"],
         "note_type": row["note_type"],
         "status": row["status"],
-        "body": row["body"],
+        "title": row["title"],
+        "body_format": row["body_format"],
+        "body_preview": note_body_preview(row["body"]),
         "updated_at": row["updated_at"],
     }
+
+
+def _resolve_note_body(args: argparse.Namespace) -> str:
+    if args.body_file is not None:
+        return Path(args.body_file).read_text()
+    if args.body_stdin:
+        return sys.stdin.read()
+    return args.body
+
+
+def _format_note_markdown(note: dict[str, Any]) -> str:
+    header = [
+        f"id: {note['id']}",
+        f"entity: {note['entity_type']}:{note['entity_id']}",
+        f"type: {note['note_type']}",
+        f"status: {note['status']}",
+        f"title: {note['title'] or ''}",
+        f"body_format: {note['body_format']}",
+        f"updated_at: {note['updated_at']}",
+        "---",
+        note["body"],
+    ]
+    return "\n".join(header)
+
+
+def _format_experiment_context_markdown(context: dict[str, Any]) -> str:
+    experiment = context["experiment"]
+    sections = [
+        f"# Fieldbook Context: {experiment['name']}",
+        "",
+        "## Summary",
+        "",
+        f"- Experiment ID: `{experiment['id']}`",
+        f"- Status: `{experiment['status']}`",
+        f"- Runs: `{context['run_count']}`",
+        f"- Jobs: `{context['job_counts']}`",
+        "",
+        "## Jobs",
+        "",
+        _format_job_list("Stale jobs", context["stale_jobs"]),
+        "",
+        _format_job_list("Failed jobs", context["failed_jobs"]),
+        "",
+        "## Key Artifacts",
+        "",
+        _format_artifact_list(context["key_artifacts"]),
+        "",
+    ]
+    note_sections = [
+        ("Open Handoffs", "open_handoffs"),
+        ("Open Next Actions", "open_next_actions"),
+        ("Open Debug Notes", "open_debug"),
+        ("Recent Research", "recent_research"),
+        ("Recent Decisions", "recent_decisions"),
+    ]
+    for title, key in note_sections:
+        sections.extend(["", f"## {title}", "", _format_note_list(context["notes"][key])])
+    return "\n".join(sections).rstrip() + "\n"
+
+
+def _format_job_list(title: str, jobs: list[dict[str, Any]]) -> str:
+    if not jobs:
+        return f"### {title}\n\n(none)"
+    lines = [f"### {title}", ""]
+    for job in jobs:
+        lines.append(f"- `{job['id']}` {job.get('name') or ''} status=`{job['status']}`")
+    return "\n".join(lines)
+
+
+def _format_artifact_list(artifacts: list[dict[str, Any]]) -> str:
+    if not artifacts:
+        return "(none)"
+    return "\n".join(f"- `{artifact['id']}` {artifact['type']}: {artifact['uri']}" for artifact in artifacts)
+
+
+def _format_note_list(notes: list[dict[str, Any]]) -> str:
+    if not notes:
+        return "(none)"
+    blocks: list[str] = []
+    for note in notes:
+        title = f" — {note['title']}" if note.get("title") else ""
+        blocks.append(
+            "\n".join(
+                [
+                    f"### `{note['id']}`{title}",
+                    "",
+                    f"- Type: `{note['note_type']}`",
+                    f"- Status: `{note['status']}`",
+                    f"- Updated: `{note['updated_at']}`",
+                    "",
+                    note["body"],
+                ]
+            )
+        )
+    return "\n\n".join(blocks)
 
 
 def _repo_command(command: Command) -> Callable[[argparse.Namespace], int]:
@@ -428,6 +542,12 @@ def _add_experiment_parsers(subparsers: argparse._SubParsersAction) -> None:
     status.add_argument("experiment")
     status.add_argument("--stale-hours", type=float, default=24.0)
     status.set_defaults(func=_repo_command(_experiment_status))
+
+    context = commands.add_parser("context")
+    _common_repo_parser(context)
+    context.add_argument("experiment")
+    context.add_argument("--stale-hours", type=float, default=24.0)
+    context.set_defaults(func=_repo_command(_experiment_context))
 
     archive = commands.add_parser("archive")
     _common_repo_parser(archive)
@@ -598,7 +718,12 @@ def _add_note_parsers(subparsers: argparse._SubParsersAction) -> None:
     add.add_argument("--entity-id", required=True)
     add.add_argument("--type", required=True)
     add.add_argument("--status", default="open")
-    add.add_argument("--body", required=True)
+    add.add_argument("--title")
+    body_group = add.add_mutually_exclusive_group(required=True)
+    body_group.add_argument("--body")
+    body_group.add_argument("--body-file")
+    body_group.add_argument("--body-stdin", action="store_true")
+    add.add_argument("--body-format", default="markdown", choices=sorted(NOTE_BODY_FORMATS))
     add.add_argument("--author")
     _add_attr_option(add)
     add.set_defaults(func=_repo_command(_note_add))
@@ -611,6 +736,11 @@ def _add_note_parsers(subparsers: argparse._SubParsersAction) -> None:
     list_parser.add_argument("--status")
     _add_include_verbose(list_parser)
     list_parser.set_defaults(func=_repo_command(_note_list))
+
+    show = commands.add_parser("show")
+    _common_repo_parser(show)
+    show.add_argument("note")
+    show.set_defaults(func=_repo_command(_note_show))
 
     resolve = commands.add_parser("resolve")
     _common_repo_parser(resolve)

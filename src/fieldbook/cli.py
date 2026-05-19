@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import sqlite3
 import sys
 from collections.abc import Callable
@@ -16,6 +17,14 @@ from fieldbook.adapters import (
 )
 from fieldbook.db import connect, discover_ledger, init_ledger, resolve_init_path
 from fieldbook.errors import ExitCode, FieldbookError, LedgerBusyError, NotFoundError, ValidationError
+from fieldbook.git_info import current_git_revision
+from fieldbook.ledger_resolution import (
+    LedgerResolution,
+    db_where_payload,
+    ensure_marker_gitignore,
+    resolve_ledger_location,
+    session_marker_path,
+)
 from fieldbook.output import emit
 from fieldbook.doctor import doctor_failed, format_doctor_text, list_doctor_checks, run_doctor
 from fieldbook.repository import Repository, note_body_preview
@@ -39,12 +48,15 @@ def _add_attr_option(parser: argparse.ArgumentParser) -> None:
 
 
 def _with_repo(args: argparse.Namespace, command: Command) -> int:
-    ledger_path = discover_ledger(ledger=args.ledger)
+    resolution = resolve_ledger_location(ledger=args.ledger)
+    args._fieldbook_resolution = resolution
+    ledger_path = resolution.path
     if ledger_path is None:
         raise NotFoundError("Fieldbook ledger not found; run `fieldbook init` first")
     conn = connect(ledger_path, allow_newer_readonly=_is_read_only(args))
     try:
-        repo = Repository(conn)
+        session_id, _, _ = _resolved_session_id(resolution)
+        repo = Repository(conn, current_session_id=session_id)
         payload = command(args, repo)
     finally:
         conn.close()
@@ -79,6 +91,8 @@ def _is_read_only(args: argparse.Namespace) -> bool:
         )
     if command in {"db", "sql"}:
         return True
+    if command == "session":
+        return getattr(args, "session_command", None) in {"current", "list"}
     if command == "writeback":
         return getattr(args, "writeback_command", None) == "log" or (
             getattr(args, "writeback_command", None) == "wandb" and not getattr(args, "apply", False)
@@ -100,6 +114,14 @@ def _cmd_init(args: argparse.Namespace) -> int:
 def _cmd_db_path(args: argparse.Namespace) -> int:
     ledger_path = discover_ledger(ledger=args.ledger)
     emit({"path": str(ledger_path)}, json_output=args.json, text=str(ledger_path))
+    return ExitCode.SUCCESS
+
+
+def _cmd_db_where(args: argparse.Namespace) -> int:
+    resolution = resolve_ledger_location(ledger=args.ledger, require_exists=False)
+    payload = db_where_payload(resolution)
+    text = payload["ledger_path"] or f"no Fieldbook ledger found; would initialize at {payload['would_init_at']}"
+    emit(payload, json_output=args.json, text=str(text))
     return ExitCode.SUCCESS
 
 
@@ -132,13 +154,19 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     if args.list_checks:
         emit(list_doctor_checks(), json_output=args.json)
         return ExitCode.SUCCESS
-    ledger_path = discover_ledger(ledger=args.ledger)
+    resolution = resolve_ledger_location(ledger=args.ledger)
+    ledger_path = resolution.path
+    if ledger_path is None:
+        raise NotFoundError("Fieldbook ledger not found; run `fieldbook init` first")
     try:
         envelope = run_doctor(
             ledger_path,
             check_ids=args.check,
             stale_hours=args.stale_hours,
+            stale_session_hours=args.stale_session_hours,
+            locality_recent_days=args.locality_recent_days,
             cwd=Path.cwd(),
+            resolved_via=resolution.resolved_via,
         )
     except ValueError as exc:
         raise ValidationError(str(exc)) from exc
@@ -407,6 +435,7 @@ def _experiment_create(args: argparse.Namespace, repo: Repository) -> dict[str, 
         description=args.description,
         tags=args.tag,
         attrs=parse_attrs(args.attr),
+        idempotency_key=args.idempotency_key,
     )
 
 
@@ -611,6 +640,85 @@ def _note_show(args: argparse.Namespace, repo: Repository) -> dict[str, Any] | s
 
 def _note_archive(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
     return repo.archive_note(args.note)
+
+
+def _session_start(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    resolution = args._fieldbook_resolution
+    session = repo.start_session(
+        experiment_ref=args.experiment,
+        agent=args.agent,
+        intent=args.intent,
+        attrs=parse_attrs(args.attr),
+        force_archived=args.force_archived,
+        **_session_context_fields(resolution),
+    )
+    marker = _write_session_marker(resolution, session["id"])
+    return {"session": session, **marker}
+
+
+def _session_current(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    resolution = args._fieldbook_resolution
+    raw_id, source, marker_status = _resolved_session_id(resolution)
+    _marker_id, marker_file_status = _marker_session_id(resolution)
+    session = repo.current_session()
+    session_status = "missing"
+    if raw_id and session is None:
+        session_status = "stale"
+    if raw_id and session is not None:
+        session_status = "ok"
+    return {
+        "session": session,
+        "resolved_session_id": raw_id,
+        "resolution_source": source,
+        "marker_path": str(session_marker_path(resolution)),
+        "marker_status": marker_file_status if source == "FIELDBOOK_SESSION_ID" else marker_status,
+        "session_status": session_status,
+    }
+
+
+def _session_switch(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    resolution = args._fieldbook_resolution
+    payload = repo.switch_session(
+        to_experiment_ref=args.to,
+        agent=args.agent,
+        intent=args.intent,
+        attrs=parse_attrs(args.attr),
+        force_archived=args.force_archived,
+        **_session_context_fields(resolution),
+    )
+    payload.update(_write_session_marker(resolution, payload["session"]["id"]))
+    return payload
+
+
+def _session_end(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    resolution = args._fieldbook_resolution
+    payload = repo.end_session(session_ref=args.id, force=args.force)
+    marker_path = session_marker_path(resolution)
+    closed_session = payload.get("session")
+    if payload.get("closed") and closed_session is not None:
+        marker_id, _marker_status = _marker_session_id(resolution)
+        if marker_id == closed_session["id"]:
+            try:
+                marker_path.unlink()
+            except FileNotFoundError:
+                pass
+        env_id = os.environ.get("FIELDBOOK_SESSION_ID")
+        if env_id == closed_session["id"]:
+            payload["env_hint"] = "FIELDBOOK_SESSION_ID still points at the closed session; unset it in the parent shell."
+    payload["marker_path"] = str(marker_path)
+    payload["marker_status"] = "removed" if not marker_path.exists() else "unchanged"
+    return payload
+
+
+def _session_list(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return {
+        "sessions": repo.list_sessions(
+            experiment_ref=args.experiment,
+            agent=args.agent,
+            open_only=args.open,
+            limit=args.limit,
+        )
+    }
 
 
 def _reconcile_file(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
@@ -821,6 +929,44 @@ def _format_note_list(notes: list[dict[str, Any]]) -> str:
     return "\n\n".join(blocks)
 
 
+def _session_context_fields(resolution: LedgerResolution) -> dict[str, str | None]:
+    commit, _dirty = current_git_revision(resolution.cwd)
+    return {
+        "cwd": str(resolution.cwd),
+        "git_root": str(resolution.git_root) if resolution.git_root else None,
+        "git_worktree_dir": str(resolution.git_worktree_dir) if resolution.git_worktree_dir else None,
+        "git_branch": resolution.git_branch,
+        "git_commit": commit,
+    }
+
+
+def _resolved_session_id(resolution: LedgerResolution) -> tuple[str | None, str | None, str]:
+    env_id = os.environ.get("FIELDBOOK_SESSION_ID")
+    if env_id:
+        return env_id, "FIELDBOOK_SESSION_ID", "env"
+    marker_id, marker_status = _marker_session_id(resolution)
+    return marker_id, "marker" if marker_id else None, marker_status
+
+
+def _marker_session_id(resolution: LedgerResolution) -> tuple[str | None, str]:
+    marker = session_marker_path(resolution)
+    try:
+        text = marker.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, "missing"
+    if not text.startswith("id: ") or not text.endswith("\n"):
+        return None, "malformed"
+    session_id = text[4:].strip()
+    return (session_id or None), "ok" if session_id else "malformed"
+
+
+def _write_session_marker(resolution: LedgerResolution, session_id: str) -> dict[str, str]:
+    marker = session_marker_path(resolution)
+    marker.write_text(f"id: {session_id}\n", encoding="utf-8")
+    ensure_marker_gitignore(marker)
+    return {"marker_path": str(marker), "marker_status": "ok"}
+
+
 def _repo_command(command: Command) -> Callable[[argparse.Namespace], int]:
     return lambda args: _with_repo(args, command)
 
@@ -854,6 +1000,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_artifact_parsers(subparsers)
     _add_metric_parsers(subparsers)
     _add_note_parsers(subparsers)
+    _add_session_parsers(subparsers)
     _add_reconcile_parsers(subparsers)
     _add_writeback_parsers(subparsers)
     _add_export_parsers(subparsers)
@@ -871,6 +1018,8 @@ def _add_doctor_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--check", action="append", default=[])
     parser.add_argument("--list-checks", action="store_true")
     parser.add_argument("--stale-hours", type=float, default=24.0)
+    parser.add_argument("--stale-session-hours", type=float, default=24.0)
+    parser.add_argument("--locality-recent-days", type=float, default=7.0)
     parser.add_argument("--strict", action="store_true")
     parser.set_defaults(func=_cmd_doctor)
 
@@ -931,6 +1080,7 @@ def _add_experiment_parsers(subparsers: argparse._SubParsersAction) -> None:
     create.add_argument("--name", required=True)
     create.add_argument("--description")
     create.add_argument("--tag", action="append", default=[])
+    create.add_argument("--idempotency-key")
     _add_attr_option(create)
     create.set_defaults(func=_repo_command(_experiment_create))
 
@@ -1235,6 +1385,51 @@ def _add_db_parsers(subparsers: argparse._SubParsersAction) -> None:
     path = commands.add_parser("path")
     _add_common_options(path)
     path.set_defaults(func=_cmd_db_path)
+
+    where = commands.add_parser("where")
+    _add_common_options(where)
+    where.set_defaults(func=_cmd_db_where)
+
+
+def _add_session_parsers(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("session", help="Manage advisory agent sessions")
+    commands = parser.add_subparsers(dest="session_command", required=True)
+
+    start = commands.add_parser("start")
+    _common_repo_parser(start)
+    start.add_argument("--experiment")
+    start.add_argument("--agent", default="codex")
+    start.add_argument("--intent")
+    start.add_argument("--force-archived", action="store_true")
+    _add_attr_option(start)
+    start.set_defaults(func=_repo_command(_session_start))
+
+    switch = commands.add_parser("switch")
+    _common_repo_parser(switch)
+    switch.add_argument("--to", required=True)
+    switch.add_argument("--agent", default="codex")
+    switch.add_argument("--intent")
+    switch.add_argument("--force-archived", action="store_true")
+    _add_attr_option(switch)
+    switch.set_defaults(func=_repo_command(_session_switch))
+
+    end = commands.add_parser("end")
+    _common_repo_parser(end)
+    end.add_argument("--id")
+    end.add_argument("--force", action="store_true")
+    end.set_defaults(func=_repo_command(_session_end))
+
+    current = commands.add_parser("current")
+    _common_repo_parser(current)
+    current.set_defaults(func=_repo_command(_session_current))
+
+    list_parser = commands.add_parser("list")
+    _common_repo_parser(list_parser)
+    list_parser.add_argument("--experiment")
+    list_parser.add_argument("--agent")
+    list_parser.add_argument("--open", action="store_true")
+    list_parser.add_argument("--limit", type=int, default=20)
+    list_parser.set_defaults(func=_repo_command(_session_list))
 
 
 def _add_sql_parser(subparsers: argparse._SubParsersAction) -> None:

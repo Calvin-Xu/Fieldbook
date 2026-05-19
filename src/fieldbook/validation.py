@@ -33,6 +33,7 @@ MAX_NOTE_BODY_BYTES = 64 * 1024
 UTC_Z_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
 ATTR_KEY_RE = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$")
 SHA256_RE = re.compile(r"^sha256:[0-9a-fA-F]{64}$")
+IDEMPOTENCY_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 
 
 def require_choice(value: str, choices: set[str], label: str) -> str:
@@ -83,6 +84,14 @@ def validate_content_hash(value: str | None) -> str | None:
     if not SHA256_RE.match(value):
         raise ValidationError("content hash must match sha256:<64 hex characters>")
     return value.lower()
+
+
+def validate_idempotency_key(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not IDEMPOTENCY_KEY_RE.match(value):
+        raise ValidationError("idempotency key must match ^[a-z0-9][a-z0-9._-]{0,127}$")
+    return value
 
 
 def parse_attrs(pairs: list[str] | None) -> dict[str, Any]:

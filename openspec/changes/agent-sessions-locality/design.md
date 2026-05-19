@@ -98,7 +98,8 @@ For the default `.experiments/ledger.sqlite` layout this is the repo/worktree
 root. For a `.fieldbook` shared-ledger config this is the directory containing
 the `.fieldbook` file. For an explicit standalone ledger path this is the
 ledger file's parent directory. The marker format is exactly
-`id: <session_id>\n`. The marker is git-ignored by default.
+`id: <session_id>\n`. The marker is git-ignored by default; session start and
+switch may append `.fieldbook.session` to the marker directory's `.gitignore`.
 
 ### Decision: Session switch is local and transactional
 
@@ -124,6 +125,12 @@ reconcile also store the ID in `attrs.session_id`. Session resolution prefers
 `FIELDBOOK_SESSION_ID` over `.fieldbook.session`. If the resolved ID does not
 exist or is closed, Fieldbook writes without a session stamp and doctor surfaces
 the stale marker/session problem later.
+
+SQLite does not enforce `ON DELETE SET NULL` semantics on foreign keys added by
+`ALTER TABLE`. Phase 11 never deletes sessions, so the nullable
+`reconcile_events.session_id` reference is provenance metadata rather than a
+cleanup contract. Future hard-delete or compaction work should rebuild the table
+if enforced FK cleanup becomes necessary.
 
 ## Defaults
 

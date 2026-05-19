@@ -17,6 +17,10 @@ or export collaborator-ready data.
 - Do not dump the entire ledger into context. Start with one experiment's
   compact `status`, use `experiment context` when full handoff context is
   needed, then drill into specific runs, jobs, artifacts, metrics, or notes.
+- Before mutating a ledger after a context switch, run `fieldbook db where
+  --json` to confirm ledger locality and identity.
+- Use advisory sessions for agent context switching. They are provenance and
+  handoff records, not locks.
 
 ## Initialize A Ledger
 
@@ -29,6 +33,16 @@ uv run fieldbook init --json
 If the repo has no Git root, this creates `.experiments/ledger.sqlite` under
 the current working directory. Use `--ledger` or `FIELDBOOK_LEDGER` only when
 the user wants an explicit non-default ledger.
+
+To share a ledger across worktrees without adding Fieldbook as a project
+dependency, add a minimal `.fieldbook` file:
+
+```yaml
+ledger: ../shared-fieldbook/ledger.sqlite
+```
+
+Relative paths resolve relative to the `.fieldbook` file. Malformed configs
+are hard errors; Fieldbook will not silently fall back to a different ledger.
 
 From a downstream repo that should not depend on Fieldbook, use a sidecar
 checkout instead of editing the downstream `pyproject.toml`:
@@ -43,6 +57,7 @@ command or subcommand: `fieldbook experiment list --ledger <path> --json`.
 ## Context Switch Back To An Experiment
 
 ```bash
+uv run fieldbook db where --json
 uv run fieldbook experiment list --json
 uv run fieldbook experiment status "$EXP_ID" --json
 uv run fieldbook experiment context "$EXP_ID"
@@ -61,6 +76,36 @@ uv run fieldbook note list --entity-type experiment --entity-id "$EXP_ID" --stat
 uv run fieldbook note show "$NOTE_ID" --json
 ```
 
+Use sessions when starting, leaving, or switching active research context:
+
+```bash
+uv run fieldbook session start \
+  --experiment "$EXP_ID" \
+  --agent codex \
+  --intent "debug downstream eval retries" \
+  --json
+
+uv run fieldbook session current --json
+
+uv run fieldbook session switch \
+  --to "$NEXT_EXP_ID" \
+  --agent codex \
+  --intent "collect completed metrics" \
+  --json
+
+uv run fieldbook session end --json
+```
+
+`session start` writes `.fieldbook.session` next to the resolved ledger root.
+Fieldbook also adds `.fieldbook.session` to the marker directory's `.gitignore`
+when needed. `FIELDBOOK_SESSION_ID` overrides the marker when present; unset it
+in the parent shell after ending an env-selected session. The `session end`
+JSON payload includes `env_hint` when this cleanup is needed. `session switch`
+atomically closes the old session, writes a Markdown handoff note on the old
+experiment, opens the new session, updates the marker, and prints the target
+experiment context. Sessions are advisory: multiple open sessions are allowed,
+and stale sessions are doctor warnings rather than locks.
+
 ## Record Work
 
 Create an experiment:
@@ -69,6 +114,7 @@ Create an experiment:
 uv run fieldbook experiment create \
   --name "short research thread name" \
   --description "one-sentence objective" \
+  --idempotency-key "project.short-research-thread-name" \
   --tag marin \
   --attr marin.issue=5416 \
   --json
@@ -230,6 +276,8 @@ ledger:
 uv run fieldbook doctor --json
 uv run fieldbook doctor --list-checks --json
 uv run fieldbook doctor --check stale-jobs --stale-hours 12 --json
+uv run fieldbook doctor --check stale-sessions --stale-session-hours 24 --json
+uv run fieldbook doctor --check ledger-locality --locality-recent-days 7 --json
 ```
 
 `doctor` is read-only. It returns stable issue codes and suggested next
@@ -254,6 +302,7 @@ tables, prefer `export metrics-long`, `export runs-wide`, or `export coverage`.
 Use stable views for ad hoc analysis and dashboard prototypes:
 
 ```bash
+uv run fieldbook db where --json
 uv run fieldbook db path --json
 uv run fieldbook sql --query "SELECT * FROM v_experiment_summary_v1" --limit 100 --json
 uv run fieldbook sql --file /tmp/query.sql --format csv > /tmp/results.csv

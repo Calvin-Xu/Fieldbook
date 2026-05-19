@@ -1,28 +1,18 @@
-import os
 import sqlite3
 from importlib import resources
 from pathlib import Path
 from typing import Mapping
 
 from fieldbook.errors import LedgerBusyError, NotFoundError, ValidationError
+from fieldbook.ledger_resolution import (
+    DEFAULT_LEDGER_RELATIVE_PATH,
+    find_git_root,
+    resolve_init_location,
+    resolve_ledger_location,
+)
 
 
-DEFAULT_LEDGER_RELATIVE_PATH = Path(".experiments") / "ledger.sqlite"
-CURRENT_SCHEMA_VERSION = 8
-
-
-def _parents_inclusive(path: Path) -> list[Path]:
-    resolved = path.resolve()
-    if resolved.is_file():
-        resolved = resolved.parent
-    return [resolved, *resolved.parents]
-
-
-def find_git_root(start: Path) -> Path | None:
-    for candidate in _parents_inclusive(start):
-        if (candidate / ".git").exists():
-            return candidate
-    return None
+CURRENT_SCHEMA_VERSION = 9
 
 
 def resolve_init_path(
@@ -31,16 +21,9 @@ def resolve_init_path(
     env: Mapping[str, str] | None = None,
 ) -> Path:
     """Resolve the ledger path for `fieldbook init`."""
-    env = os.environ if env is None else env
-    if ledger is not None:
-        return Path(ledger).expanduser().resolve()
-    env_ledger = env.get("FIELDBOOK_LEDGER")
-    if env_ledger:
-        return Path(env_ledger).expanduser().resolve()
-
-    start = Path.cwd() if start is None else start
-    root = find_git_root(start) or Path(start).resolve()
-    return root / DEFAULT_LEDGER_RELATIVE_PATH
+    resolution = resolve_init_location(start=start, ledger=ledger, env=env)
+    assert resolution.path is not None
+    return resolution.path
 
 
 def discover_ledger(
@@ -49,25 +32,10 @@ def discover_ledger(
     env: Mapping[str, str] | None = None,
 ) -> Path:
     """Find an existing ledger for non-init commands."""
-    env = os.environ if env is None else env
-    if ledger is not None:
-        ledger_path = Path(ledger).expanduser().resolve()
-        if not ledger_path.exists():
-            raise NotFoundError(f"Fieldbook ledger not found: {ledger_path}")
-        return ledger_path
-    env_ledger = env.get("FIELDBOOK_LEDGER")
-    if env_ledger:
-        ledger_path = Path(env_ledger).expanduser().resolve()
-        if not ledger_path.exists():
-            raise NotFoundError(f"Fieldbook ledger not found: {ledger_path}")
-        return ledger_path
-
-    start = Path.cwd() if start is None else start
-    for candidate in _parents_inclusive(start):
-        ledger_path = candidate / DEFAULT_LEDGER_RELATIVE_PATH
-        if ledger_path.exists():
-            return ledger_path
-    raise NotFoundError("no Fieldbook ledger found; run `fieldbook init` first")
+    resolution = resolve_ledger_location(start=start, ledger=ledger, env=env, require_exists=True)
+    if resolution.path is None:
+        raise NotFoundError("no Fieldbook ledger found; run `fieldbook init` first")
+    return resolution.path
 
 
 def connect(path: Path, *, migrate: bool = True, allow_newer_readonly: bool = False) -> sqlite3.Connection:

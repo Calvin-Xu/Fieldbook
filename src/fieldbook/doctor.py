@@ -13,7 +13,7 @@ from fieldbook.time_utils import utc_now
 
 
 STALE_JOB_STATUSES = ("queued", "running")
-ATTR_TABLES = ("experiments", "runs", "jobs", "artifacts", "notes", "reconcile_events", "sync_events")
+ATTR_TABLES = ("experiments", "runs", "jobs", "artifacts", "notes", "reconcile_events", "sync_events", "sessions")
 ENTITY_TABLES = {
     "experiment": "experiments",
     "run": "runs",
@@ -65,7 +65,11 @@ class DoctorCheck:
 @dataclass(frozen=True)
 class DoctorOptions:
     stale_hours: float
+    stale_session_hours: float
+    locality_recent_days: float
     cwd: Path
+    ledger_path: Path
+    resolved_via: str | None
 
 
 def list_doctor_checks() -> dict[str, Any]:
@@ -78,6 +82,9 @@ def run_doctor(
     check_ids: list[str] | None,
     stale_hours: float,
     cwd: Path,
+    stale_session_hours: float = 24.0,
+    locality_recent_days: float = 7.0,
+    resolved_via: str | None = None,
 ) -> dict[str, Any]:
     selected_checks = _selected_checks(check_ids)
     conn = _connect_readonly(ledger_path)
@@ -101,7 +108,14 @@ def run_doctor(
                     )
                 ],
             )
-        options = DoctorOptions(stale_hours=stale_hours, cwd=cwd)
+        options = DoctorOptions(
+            stale_hours=stale_hours,
+            stale_session_hours=stale_session_hours,
+            locality_recent_days=locality_recent_days,
+            cwd=cwd,
+            ledger_path=ledger_path,
+            resolved_via=resolved_via,
+        )
         issues: list[DoctorIssue] = []
         for check in selected_checks:
             issues.extend(check.runner(conn, options))
@@ -448,6 +462,70 @@ def _check_reconcile_log(conn: sqlite3.Connection, _options: DoctorOptions) -> l
     return issues
 
 
+def _check_stale_sessions(conn: sqlite3.Connection, options: DoctorOptions) -> list[DoctorIssue]:
+    cutoff = (
+        datetime.now(timezone.utc).replace(microsecond=0) - timedelta(hours=options.stale_session_hours)
+    ).isoformat().replace("+00:00", "Z")
+    rows = conn.execute(
+        "SELECT id, experiment_id, agent, cwd, started_at, last_touch_at FROM sessions "
+        "WHERE ended_at IS NULL AND last_touch_at < ? ORDER BY last_touch_at, id",
+        (cutoff,),
+    ).fetchall()
+    return [
+        DoctorIssue(
+            code="session.stale_open",
+            severity="warning",
+            entity_type="session",
+            entity_id=row["id"],
+            message="open session has not been touched recently",
+            details={
+                "experiment_id": row["experiment_id"],
+                "agent": row["agent"],
+                "cwd": row["cwd"],
+                "started_at": row["started_at"],
+                "last_touch_at": row["last_touch_at"],
+                "stale_session_hours": options.stale_session_hours,
+            },
+            suggested_next_action=f"Run `fieldbook session end --id {row['id']} --force` if this session is stale.",
+        )
+        for row in rows
+    ]
+
+
+def _check_ledger_locality(_conn: sqlite3.Connection, options: DoctorOptions) -> list[DoctorIssue]:
+    if options.resolved_via in {"--ledger", "FIELDBOOK_LEDGER", ".fieldbook"}:
+        return []
+    if options.ledger_path != options.cwd.resolve() / ".experiments" / "ledger.sqlite":
+        return []
+    siblings = []
+    parent = options.cwd.resolve().parent
+    cutoff = datetime.now(timezone.utc).timestamp() - options.locality_recent_days * 24 * 60 * 60
+    for candidate in parent.glob("*/.experiments/ledger.sqlite"):
+        if candidate.resolve() == options.ledger_path.resolve():
+            continue
+        try:
+            modified = candidate.stat().st_mtime
+        except OSError:
+            continue
+        if modified >= cutoff:
+            siblings.append(str(candidate.resolve()))
+    if not siblings:
+        return []
+    return [
+        DoctorIssue(
+            code="ledger.locality_split_possible",
+            severity="warning",
+            message="implicit cwd-walk resolved a local ledger while adjacent recent ledgers exist",
+            details={
+                "resolved_ledger": str(options.ledger_path),
+                "adjacent_ledgers": sorted(siblings),
+                "locality_recent_days": options.locality_recent_days,
+            },
+            suggested_next_action="Run `fieldbook db where --json`; use --ledger, FIELDBOOK_LEDGER, or .fieldbook if a shared ledger was intended.",
+        )
+    ]
+
+
 def _local_artifact_path(uri: str, *, cwd: Path) -> Path | None:
     parsed = urlparse(uri)
     if parsed.scheme in {"gs", "s3", "http", "https"}:
@@ -518,5 +596,19 @@ DOCTOR_CHECKS: dict[str, DoctorCheck] = {
         default_enabled=True,
         severity="error",
         runner=_check_reconcile_log,
+    ),
+    "stale-sessions": DoctorCheck(
+        id="stale-sessions",
+        description="Detect advisory sessions that have not been touched recently.",
+        default_enabled=True,
+        severity="warning",
+        runner=_check_stale_sessions,
+    ),
+    "ledger-locality": DoctorCheck(
+        id="ledger-locality",
+        description="Detect likely implicit local ledger splits across adjacent worktrees.",
+        default_enabled=True,
+        severity="warning",
+        runner=_check_ledger_locality,
     ),
 }

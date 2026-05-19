@@ -44,6 +44,7 @@ def export_snapshot(
                 dest.close()
             counts = table_counts(source)
             source_schema = schema_version(source)
+            ledger_id = _ledger_id(source)
         finally:
             source.close()
 
@@ -52,6 +53,7 @@ def export_snapshot(
             "exported_at": utc_now(),
             "source_ledger": str(ledger_path),
             "schema_version": source_schema,
+            "ledger_id": ledger_id,
             "fieldbook_version": _fieldbook_version(),
             "table_counts": counts,
         }
@@ -64,6 +66,7 @@ def export_snapshot(
             "output": str(output_path),
             "metadata_path": str(metadata_path) if metadata else None,
             "schema_version": source_schema,
+            "ledger_id": ledger_id,
             "table_counts": counts,
         }
     except Exception:
@@ -131,6 +134,11 @@ def table_counts(conn: sqlite3.Connection) -> dict[str, int]:
         ).fetchall()
     ]
     return {table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for table in tables}
+
+
+def _ledger_id(conn: sqlite3.Connection) -> str | None:
+    row = conn.execute("SELECT value FROM schema_metadata WHERE key = 'ledger_id'").fetchone()
+    return str(row["value"]) if row else None
 
 
 def _connect_readonly(path: Path) -> sqlite3.Connection:

@@ -79,6 +79,16 @@ An admin UI can come later if the CLI and schema prove useful.
 - **Reconcile**: a refresh operation that inspects external systems and
   proposes ledger updates, reducing drift when humans or agents forget to log
   a job at launch time.
+- **Session**: an advisory agent context record for one working interval. It
+  is not a lock; it lets agents resume, switch experiments, and stamp notes or
+  reconcile events with local provenance.
+
+## Phase Index
+
+Fieldbook uses semantic OpenSpec change IDs and a human phase index in
+`PHASES.md`. Phase numbers are forward-only. Phase 11 is
+`agent-sessions-locality`, which adds ledger identity, `.fieldbook` shared
+ledger pointers, idempotent experiment creation, and advisory agent sessions.
 
 ## First Implementation Phase
 
@@ -194,6 +204,47 @@ uv run fieldbook experiment triage "$EXP_ID" --json
 jobs, key artifacts, and note previews. `context` is the LLM-ready Markdown
 handoff surface with full bodies for active handoff, next-action, and debug
 notes plus recent research and decision notes.
+
+Before writing to a ledger, inspect locality:
+
+```bash
+uv run fieldbook db where --json
+```
+
+`db where` explains the resolved ledger path, ledger ID, cwd, git context,
+resolution source, and where `init` would create a ledger if none exists.
+Resolution order is `--ledger`, `FIELDBOOK_LEDGER`, nearest `.fieldbook` with
+`ledger: <path>`, then cwd-walk for `.experiments/ledger.sqlite`. Relative
+`.fieldbook` paths resolve relative to the `.fieldbook` file.
+
+Use idempotency keys for agent-created experiments so retries do not create
+duplicates:
+
+```bash
+EXP_ID=$(uv run fieldbook experiment create \
+  --name "300M eval proxy sprint" \
+  --idempotency-key "marin.300m-eval-proxy-sprint" \
+  --json | python -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+```
+
+Start a session when beginning work, switch when context-changing, and end it
+when leaving the experiment:
+
+```bash
+uv run fieldbook session start --experiment "$EXP_ID" --agent codex --intent "analyze eval coverage" --json
+uv run fieldbook session current --json
+uv run fieldbook session switch --to "$OTHER_EXP_ID" --intent "triage failed evals" --json
+uv run fieldbook session end --json
+```
+
+`session switch` closes the old session, writes a Markdown handoff note on the
+old experiment, opens the new session, updates `.fieldbook.session`, and returns
+the new experiment context. Sessions are advisory: multiple open sessions are
+allowed, and writes still work without a session. Doctor reports stale sessions
+instead of blocking work. `FIELDBOOK_SESSION_ID` overrides the marker for
+session stamping; unset it in the parent shell after ending an env-selected
+session. Starting or switching a session also appends `.fieldbook.session` to
+the marker directory's `.gitignore` when needed.
 
 For multiline Markdown notes, prefer a body file:
 

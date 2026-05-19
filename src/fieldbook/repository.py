@@ -24,6 +24,7 @@ from fieldbook.validation import (
     normalize_tag,
     require_choice,
     validate_content_hash,
+    validate_idempotency_key,
     validate_metric_value,
     validate_note_body,
     validate_note_title,
@@ -39,9 +40,10 @@ NOTE_PREVIEW_CHARS = 200
 
 
 class Repository:
-    def __init__(self, conn: sqlite3.Connection):
+    def __init__(self, conn: sqlite3.Connection, *, current_session_id: str | None = None):
         self.conn = conn
         self.conn.row_factory = sqlite3.Row
+        self.current_session_id = self._valid_open_session_id(current_session_id)
 
     def create_experiment(
         self,
@@ -50,18 +52,31 @@ class Repository:
         description: str | None,
         tags: list[str],
         attrs: dict[str, Any],
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
+        idempotency_key = validate_idempotency_key(idempotency_key)
+        if idempotency_key is not None:
+            existing = self.conn.execute(
+                "SELECT * FROM experiments WHERE idempotency_key = ? AND deleted_at IS NULL ORDER BY id LIMIT 1",
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                result = self._experiment_dict(existing)
+                result["existed"] = True
+                return result
         now = utc_now()
         experiment_id = new_id("exp")
         normalized_tags = sorted({normalize_tag(tag) for tag in tags})
         with self.conn:
             self.conn.execute(
-                "INSERT INTO experiments (id, name, description, created_at, updated_at, attrs_json) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (experiment_id, name, description, now, now, attrs_json(attrs)),
+                "INSERT INTO experiments (id, name, description, idempotency_key, created_at, updated_at, attrs_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (experiment_id, name, description, idempotency_key, now, now, attrs_json(attrs)),
             )
             self._replace_experiment_tags(experiment_id, normalized_tags)
-        return self.get_experiment(experiment_id)
+        result = self.get_experiment(experiment_id)
+        result["existed"] = False
+        return result
 
     def list_experiments(self, *, tag: str | None = None, include_archived: bool = False) -> list[dict[str, Any]]:
         params: list[Any] = []
@@ -790,6 +805,7 @@ class Repository:
         title = validate_note_title(title)
         body = validate_note_body(body)
         entity_id = self._resolve_entity_id(entity_type, entity_ref)
+        attrs = self._attrs_with_session(attrs)
         now = utc_now()
         note_id = new_id("note")
         with self.conn:
@@ -864,11 +880,227 @@ class Repository:
             self.conn.execute("UPDATE notes SET deleted_at = COALESCE(deleted_at, ?), updated_at = ? WHERE id = ?", (now, now, note["id"]))
         return self.get_note(note["id"])
 
+    def start_session(
+        self,
+        *,
+        experiment_ref: str | None,
+        agent: str,
+        intent: str | None,
+        cwd: str | None,
+        git_root: str | None,
+        git_worktree_dir: str | None,
+        git_branch: str | None,
+        git_commit: str | None,
+        attrs: dict[str, Any],
+        force_archived: bool = False,
+    ) -> dict[str, Any]:
+        experiment_id = self._session_experiment_id(experiment_ref, force_archived=force_archived)
+        now = utc_now()
+        session_id = new_id("ses")
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO sessions (id, ledger_id, experiment_id, agent, cwd, git_root, git_worktree_dir, "
+                "git_branch, git_commit, intent, started_at, last_touch_at, attrs_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    self._ledger_id(),
+                    experiment_id,
+                    agent,
+                    cwd,
+                    git_root,
+                    git_worktree_dir,
+                    git_branch,
+                    git_commit,
+                    intent,
+                    now,
+                    now,
+                    attrs_json(attrs),
+                ),
+            )
+        self.current_session_id = session_id
+        return self.get_session(session_id)
+
+    def get_session(self, ref: str) -> dict[str, Any]:
+        return self._session_dict(self._resolve_row("sessions", ref))
+
+    def current_session(self) -> dict[str, Any] | None:
+        if self.current_session_id is None:
+            return None
+        row = self.conn.execute("SELECT * FROM sessions WHERE id = ?", (self.current_session_id,)).fetchone()
+        return self._session_dict(row) if row else None
+
+    def list_sessions(
+        self,
+        *,
+        experiment_ref: str | None = None,
+        agent: str | None = None,
+        open_only: bool = False,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        params: list[Any] = []
+        query = "SELECT * FROM sessions WHERE 1=1"
+        if experiment_ref:
+            query += " AND experiment_id = ?"
+            params.append(self.get_experiment(experiment_ref)["id"])
+        if agent:
+            query += " AND agent = ?"
+            params.append(agent)
+        if open_only:
+            query += " AND ended_at IS NULL"
+        query += " ORDER BY started_at DESC, id DESC LIMIT ?"
+        params.append(limit)
+        return [self._session_dict(row) for row in self.conn.execute(query, params).fetchall()]
+
+    def end_session(self, *, session_ref: str | None = None, force: bool = False) -> dict[str, Any]:
+        if session_ref is None and self.current_session_id is None:
+            return {"closed": False, "reason": "no_current_session", "session": None}
+        session_id = session_ref or self.current_session_id
+        assert session_id is not None
+        session = self.get_session(session_id)
+        if session["ended_at"] is not None and not force:
+            raise ValidationError(f"session is already closed: {session_id}")
+        if session["ended_at"] is not None and force:
+            return {"closed": False, "reason": "already_closed", "session": session}
+        now = utc_now()
+        with self.conn:
+            self.conn.execute(
+                "UPDATE sessions SET ended_at = ?, last_touch_at = ? WHERE id = ?",
+                (now, now, session_id),
+            )
+        if session_id == self.current_session_id:
+            self.current_session_id = None
+        return {"closed": True, "session": self.get_session(session_id)}
+
+    def switch_session(
+        self,
+        *,
+        to_experiment_ref: str,
+        agent: str,
+        intent: str | None,
+        cwd: str | None,
+        git_root: str | None,
+        git_worktree_dir: str | None,
+        git_branch: str | None,
+        git_commit: str | None,
+        attrs: dict[str, Any],
+        force_archived: bool = False,
+    ) -> dict[str, Any]:
+        target_experiment_id = self._session_experiment_id(to_experiment_ref, force_archived=force_archived)
+        old_session = self.current_session()
+        handoff_body = None
+        if old_session and old_session["experiment_id"]:
+            handoff_body = self._session_handoff_body(old_session)
+
+        now = utc_now()
+        new_session_id = new_id("ses")
+        handoff_note_id = None
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            if old_session:
+                self.conn.execute(
+                    "UPDATE sessions SET ended_at = ?, last_touch_at = ? WHERE id = ?",
+                    (now, now, old_session["id"]),
+                )
+                if old_session["experiment_id"] and handoff_body is not None:
+                    handoff_note_id = new_id("note")
+                    self.conn.execute(
+                        "INSERT INTO notes (id, entity_type, entity_id, note_type, status, title, body, "
+                        "body_format, created_at, updated_at, attrs_json) VALUES (?, 'experiment', ?, "
+                        "'handoff', 'open', ?, ?, 'markdown', ?, ?, ?)",
+                        (
+                            handoff_note_id,
+                            old_session["experiment_id"],
+                            f"Session handoff from {old_session['agent']}",
+                            handoff_body,
+                            now,
+                            now,
+                            attrs_json({"session_id": old_session["id"]}),
+                        ),
+                    )
+            self.conn.execute(
+                "INSERT INTO sessions (id, ledger_id, experiment_id, agent, cwd, git_root, git_worktree_dir, "
+                "git_branch, git_commit, intent, started_at, last_touch_at, attrs_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    new_session_id,
+                    self._ledger_id(),
+                    target_experiment_id,
+                    agent,
+                    cwd,
+                    git_root,
+                    git_worktree_dir,
+                    git_branch,
+                    git_commit,
+                    intent,
+                    now,
+                    now,
+                    attrs_json(attrs),
+                ),
+            )
+        except Exception:
+            self.conn.rollback()
+            raise
+        else:
+            self.conn.commit()
+
+        self.current_session_id = new_session_id
+        return {
+            "closed_session": self.get_session(old_session["id"]) if old_session else None,
+            "handoff_note": self.get_note(handoff_note_id) if handoff_note_id else None,
+            "session": self.get_session(new_session_id),
+            "context": self.experiment_context(target_experiment_id),
+        }
+
     def _active_experiment_id(self, ref: str) -> str:
         experiment = self.get_experiment(ref)
         if experiment["deleted_at"] is not None:
             raise ValidationError(f"experiment is archived/deleted and cannot be mutated: {experiment['id']}")
         return experiment["id"]
+
+    def _session_experiment_id(self, ref: str | None, *, force_archived: bool) -> str | None:
+        if ref is None:
+            return None
+        experiment = self.get_experiment(ref)
+        if experiment["deleted_at"] is not None and not force_archived:
+            raise ValidationError(f"experiment is archived/deleted; pass --force-archived to start a session: {experiment['id']}")
+        return experiment["id"]
+
+    def _session_handoff_body(self, session: dict[str, Any]) -> str:
+        assert session["experiment_id"] is not None
+        context = self.experiment_context(session["experiment_id"])
+        lines = [
+            "# Fieldbook Session Handoff",
+            "",
+            f"- Closing session: `{session['id']}`",
+            f"- Agent: `{session['agent']}`",
+            f"- Experiment: `{context['experiment']['name']}` (`{context['experiment']['id']}`)",
+            "",
+            "## Open Handoffs",
+            "",
+            *_handoff_note_lines(context["notes"]["open_handoffs"]),
+            "",
+            "## Open Next Actions",
+            "",
+            *_handoff_note_lines(context["notes"]["open_next_actions"]),
+            "",
+            "## Open Debug Notes",
+            "",
+            *_handoff_note_lines(context["notes"]["open_debug"]),
+            "",
+            "## Stale Jobs",
+            "",
+            *_handoff_job_lines(context["stale_jobs"]),
+            "",
+            "## Failed Jobs",
+            "",
+            *_handoff_job_lines(context["failed_jobs"]),
+            "",
+            "## Key Artifacts",
+            "",
+            *_handoff_artifact_lines(context["key_artifacts"]),
+        ]
+        return "\n".join(lines).rstrip() + "\n"
 
     def _parent_run_id(self, ref: str | None) -> str | None:
         if ref is None:
@@ -1131,6 +1363,11 @@ class Repository:
         data["attrs"] = load_attrs(data.pop("attrs_json", "{}"))
         return data
 
+    def _session_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        data = dict(row)
+        data["attrs"] = load_attrs(data.pop("attrs_json", "{}"))
+        return data
+
     def _compact_note_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         full = self._note_dict(row)
         return {
@@ -1144,6 +1381,27 @@ class Repository:
             "body_preview": note_body_preview(full["body"]),
             "updated_at": full["updated_at"],
         }
+
+    def _ledger_id(self) -> str:
+        row = self.conn.execute("SELECT value FROM schema_metadata WHERE key = 'ledger_id'").fetchone()
+        if row is None:
+            raise ValidationError("ledger is missing ledger_id metadata; run migrations with a write-capable command")
+        return str(row["value"])
+
+    def _valid_open_session_id(self, session_id: str | None) -> str | None:
+        if not session_id:
+            return None
+        row = self.conn.execute(
+            "SELECT id FROM sessions WHERE id = ? AND ended_at IS NULL",
+            (session_id,),
+        ).fetchone()
+        return str(row["id"]) if row else None
+
+    def _attrs_with_session(self, attrs: dict[str, Any]) -> dict[str, Any]:
+        if self.current_session_id is None:
+            return attrs
+        return {"session_id": self.current_session_id, **attrs}
+
     def _metric_export_rows(self, experiment_id: str, metric_names: list[str] | None) -> list[dict[str, Any]]:
         params: list[Any] = [experiment_id]
         query = (
@@ -1183,3 +1441,33 @@ def note_body_preview(body: str) -> str:
                 return normalized[: NOTE_PREVIEW_CHARS - 1] + "…"
             return normalized
     return ""
+
+
+def _handoff_note_lines(notes: list[dict[str, Any]]) -> list[str]:
+    if not notes:
+        return ["- none"]
+    lines = []
+    for note in notes:
+        label = note.get("title") or note["note_type"]
+        preview = note.get("body_preview") or ""
+        suffix = f" — {preview}" if preview else ""
+        lines.append(f"- `{note['id']}` {label}{suffix}")
+    return lines
+
+
+def _handoff_job_lines(jobs: list[dict[str, Any]]) -> list[str]:
+    if not jobs:
+        return ["- none"]
+    return [
+        f"- `{job['id']}` {job.get('name') or '(unnamed)'} status=`{job['status']}` updated_at=`{job['updated_at']}`"
+        for job in jobs
+    ]
+
+
+def _handoff_artifact_lines(artifacts: list[dict[str, Any]]) -> list[str]:
+    if not artifacts:
+        return ["- none"]
+    return [
+        f"- `{artifact['id']}` {artifact['type']}: {artifact['uri']}"
+        for artifact in artifacts
+    ]

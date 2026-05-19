@@ -98,6 +98,7 @@ def reconcile_manifest(
             "operations": [_public_operation(operation) for operation in plan["operations"]],
         }
 
+    session_id = repo.current_session_id
     repo.conn.execute("BEGIN IMMEDIATE")
     try:
         plan = _plan(repo.conn, manifest, experiment_id)
@@ -105,7 +106,7 @@ def reconcile_manifest(
         now = utc_now()
         repo.conn.execute(
             "INSERT INTO reconcile_events (id, experiment_id, source, inserts_json, updates_json, counts_json, "
-            "created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "created_at, session_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 event_id,
                 experiment_id,
@@ -114,9 +115,10 @@ def reconcile_manifest(
                 json.dumps(plan["counts"]["update"], sort_keys=True),
                 json.dumps(plan["counts"], sort_keys=True),
                 now,
+                session_id,
             ),
         )
-        _apply_plan(repo.conn, plan, reconcile_event_id=event_id)
+        _apply_plan(repo.conn, plan, reconcile_event_id=event_id, session_id=session_id)
         _record_operations(repo.conn, event_id, plan["operations"])
     except Exception:
         repo.conn.rollback()
@@ -628,7 +630,13 @@ def _row_diff(existing: sqlite3.Row, row: dict[str, Any], *, fields: list[str]) 
     return diff
 
 
-def _apply_plan(conn: sqlite3.Connection, plan: dict[str, Any], *, reconcile_event_id: str) -> None:
+def _apply_plan(
+    conn: sqlite3.Connection,
+    plan: dict[str, Any],
+    *,
+    reconcile_event_id: str,
+    session_id: str | None,
+) -> None:
     for operation in plan["operations"]:
         if operation["action"] == "noop":
             continue
@@ -644,11 +652,11 @@ def _apply_plan(conn: sqlite3.Connection, plan: dict[str, Any], *, reconcile_eve
         elif entity == "metrics":
             _apply_metric(conn, operation)
         elif entity == "notes":
-            _apply_note(conn, operation)
+            _apply_note(conn, operation, session_id=session_id)
         elif entity == "custom_attributes":
             _apply_custom_attrs(conn, operation)
         elif entity == "sync_events":
-            _apply_sync_event(conn, operation, reconcile_event_id=reconcile_event_id)
+            _apply_sync_event(conn, operation, reconcile_event_id=reconcile_event_id, session_id=session_id)
 
 
 def _apply_run(conn: sqlite3.Connection, operation: dict[str, Any]) -> None:
@@ -812,8 +820,11 @@ def _apply_metric(conn: sqlite3.Connection, operation: dict[str, Any]) -> None:
         conn.execute("UPDATE metrics SET value = ?, updated_at = ? WHERE id = ?", (row["value"], now, row["id"]))
 
 
-def _apply_note(conn: sqlite3.Connection, operation: dict[str, Any]) -> None:
+def _apply_note(conn: sqlite3.Connection, operation: dict[str, Any], *, session_id: str | None) -> None:
     row = operation["row"]
+    attrs = dict(row.get("attrs", {}))
+    if session_id is not None:
+        attrs = {"session_id": session_id, **attrs}
     now = utc_now()
     if operation["action"] == "insert":
         conn.execute(
@@ -831,7 +842,7 @@ def _apply_note(conn: sqlite3.Connection, operation: dict[str, Any]) -> None:
                 row.get("author"),
                 now,
                 now,
-                attrs_json(row.get("attrs", {})),
+                attrs_json(attrs),
             ),
         )
     elif operation["action"] == "update":
@@ -845,7 +856,7 @@ def _apply_note(conn: sqlite3.Connection, operation: dict[str, Any]) -> None:
                 row.get("body"),
                 row.get("body_format"),
                 row.get("author"),
-                attrs_json(row.get("attrs", {})),
+                attrs_json(attrs),
                 now,
                 row["id"],
             ),
@@ -865,8 +876,17 @@ def _apply_custom_attrs(conn: sqlite3.Connection, operation: dict[str, Any]) -> 
     )
 
 
-def _apply_sync_event(conn: sqlite3.Connection, operation: dict[str, Any], *, reconcile_event_id: str) -> None:
+def _apply_sync_event(
+    conn: sqlite3.Connection,
+    operation: dict[str, Any],
+    *,
+    reconcile_event_id: str,
+    session_id: str | None,
+) -> None:
     row = operation["row"]
+    attrs = dict(row.get("attrs", {}))
+    if session_id is not None:
+        attrs = {"session_id": session_id, **attrs}
     conn.execute(
         "INSERT INTO sync_events (id, target_system, target_identifier, status, run_id, job_id, error_message, "
         "reconcile_event_id, idempotency_key, origin, source_entity_type, source_entity_id, target_field, "
@@ -887,7 +907,7 @@ def _apply_sync_event(conn: sqlite3.Connection, operation: dict[str, Any], *, re
             row.get("target_field"),
             row.get("payload_summary_json"),
             utc_now(),
-            attrs_json(row.get("attrs", {})),
+            attrs_json(attrs),
         ),
     )
 
@@ -958,6 +978,7 @@ def _event_dict(conn: sqlite3.Connection, row: sqlite3.Row, *, include_operation
         "experiment_id": data["experiment_id"],
         "source": data["source"],
         "created_at": data["created_at"],
+        "session_id": data.get("session_id"),
         "counts": _event_counts(data),
         "attrs": load_attrs(data.get("attrs_json", "{}")),
     }

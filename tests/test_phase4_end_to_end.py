@@ -140,6 +140,7 @@ def test_agent_end_to_end_flow_from_subdirectory(tmp_path):
         )
     )
     assert reconcile["counts"]["insert"]["metrics"] == 1
+    assert reconcile["counts"]["sync_event"] == 1
 
     long_path = repo / ".experiments" / "metrics_long.csv"
     wide_path = repo / ".experiments" / "runs_wide.csv"
@@ -169,3 +170,58 @@ def test_agent_end_to_end_flow_from_subdirectory(tmp_path):
 
     context = payload(run_fieldbook(subdir, "experiment", "context", experiment["id"], "--json"))
     assert context["notes"]["open_handoffs"][0]["body"] == "Collect follow-up evals.\n\nUse the exported metric table."
+
+
+def test_marin_reconcile_hardening_fixture_archives_and_logs_sync(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    run_fieldbook(repo, "init", "--json")
+    experiment = payload(
+        run_fieldbook(
+            repo,
+            "experiment",
+            "create",
+            "--name",
+            "fixture-hardening",
+            "--json",
+        )
+    )
+    fixture_dir = Path(__file__).parent / "fixtures" / "marin"
+    run_fieldbook(
+        repo,
+        "reconcile",
+        "file",
+        "--experiment",
+        experiment["id"],
+        "--path",
+        str(fixture_dir / "eval_completion_manifest.json"),
+        "--source",
+        "fixture",
+        "--apply",
+        "--json",
+    )
+
+    hardening = payload(
+        run_fieldbook(
+            repo,
+            "reconcile",
+            "file",
+            "--experiment",
+            experiment["id"],
+            "--path",
+            str(fixture_dir / "reconcile_hardening_manifest.json"),
+            "--source",
+            "hardening-fixture",
+            "--apply",
+            "--json",
+        )
+    )
+    assert hardening["counts"]["archive"] == {"jobs": 1, "notes": 1}
+    assert hardening["counts"]["sync_event"] == 1
+
+    log = payload(run_fieldbook(repo, "reconcile", "log", "--source", "hardening-fixture", "--operations", "--json"))
+    assert len(log["events"]) == 1
+    actions = {(op["entity"], op["action"]) for op in log["events"][0]["operations"]}
+    assert ("jobs", "archive") in actions
+    assert ("notes", "archive") in actions
+    assert ("sync_events", "sync_event") in actions

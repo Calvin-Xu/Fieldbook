@@ -25,6 +25,7 @@ ARTIFACT_TYPES = {
 NOTE_TYPES = {"research", "debug", "handoff", "next-action", "decision"}
 NOTE_STATUSES = {"open", "resolved", "superseded"}
 NOTE_BODY_FORMATS = {"markdown", "plain"}
+SYNC_EVENT_STATUSES = {"pending", "synced", "failed", "skipped"}
 ENTITY_TYPES = {"experiment", "run", "job", "artifact", "metric"}
 MAX_NOTE_TITLE_CHARS = 120
 MAX_NOTE_BODY_BYTES = 64 * 1024

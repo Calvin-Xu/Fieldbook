@@ -4,8 +4,17 @@ import subprocess
 import sys
 from pathlib import Path
 
-from fieldbook.db import CURRENT_SCHEMA_VERSION, connect, discover_ledger, init_ledger, resolve_init_path, schema_version
-from fieldbook.errors import NotFoundError
+from fieldbook.db import (
+    CURRENT_SCHEMA_VERSION,
+    _execute_sql_script,
+    _migration_sql,
+    connect,
+    discover_ledger,
+    init_ledger,
+    resolve_init_path,
+    schema_version,
+)
+from fieldbook.errors import NotFoundError, ValidationError
 from fieldbook.ids import new_id
 
 
@@ -227,3 +236,79 @@ def test_note_schema_has_markdown_metadata_defaults_and_constraints(tmp_path):
             raise AssertionError("expected overlong title to violate note schema constraint")
     finally:
         conn.close()
+
+
+def test_reconcile_hardening_schema_and_external_uniqueness(tmp_path):
+    ledger = tmp_path / ".experiments" / "ledger.sqlite"
+    init_ledger(ledger)
+    conn = connect(ledger)
+    try:
+        run_columns = {row["name"] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
+        sync_columns = {row["name"] for row in conn.execute("PRAGMA table_info(sync_events)").fetchall()}
+        reconcile_columns = {row["name"] for row in conn.execute("PRAGMA table_info(reconcile_events)").fetchall()}
+        tables = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        indexes = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()}
+
+        assert "parent_run_id" in run_columns
+        assert {"reconcile_event_id", "idempotency_key"}.issubset(sync_columns)
+        assert "counts_json" in reconcile_columns
+        assert "reconcile_operations" in tables
+        assert {"idx_runs_external_unique", "idx_jobs_external_unique"}.issubset(indexes)
+
+        conn.execute(
+            "INSERT INTO runs (id, name, external_system, external_id, created_at, updated_at) "
+            "VALUES ('run_a', 'A', 'wandb', 'same', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
+        )
+        try:
+            conn.execute(
+                "INSERT INTO runs (id, name, external_system, external_id, created_at, updated_at) "
+                "VALUES ('run_b', 'B', 'wandb', 'same', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
+            )
+        except sqlite3.IntegrityError:
+            pass
+        else:
+            raise AssertionError("expected duplicate active external run identifier to fail")
+
+        conn.execute("UPDATE runs SET deleted_at = '2026-01-02T00:00:00Z' WHERE id = 'run_a'")
+        conn.execute(
+            "INSERT INTO runs (id, name, external_system, external_id, created_at, updated_at) "
+            "VALUES ('run_b', 'B', 'wandb', 'same', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
+        )
+    finally:
+        conn.close()
+
+
+def test_migration_blocks_duplicate_external_identifiers(tmp_path):
+    ledger = tmp_path / "ledger.sqlite"
+    conn = sqlite3.connect(ledger)
+    try:
+        conn.execute("BEGIN")
+        for version in range(1, CURRENT_SCHEMA_VERSION):
+            _execute_sql_script(conn, _migration_sql(version))
+            conn.execute(f"PRAGMA user_version = {version}")
+            conn.execute(
+                "INSERT OR REPLACE INTO schema_metadata (key, value, updated_at) "
+                "VALUES ('schema_version', ?, datetime('now'))",
+                (str(version),),
+            )
+        conn.execute(
+            "INSERT INTO runs (id, name, external_system, external_id, created_at, updated_at) "
+            "VALUES ('run_dup_a', 'A', 'wandb', 'dup', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
+        )
+        conn.execute(
+            "INSERT INTO runs (id, name, external_system, external_id, created_at, updated_at) "
+            "VALUES ('run_dup_b', 'B', 'wandb', 'dup', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    try:
+        connect(ledger)
+    except ValidationError as exc:
+        message = str(exc)
+        assert "runs" in message
+        assert "run_dup_a" in message
+        assert "run_dup_b" in message
+    else:
+        raise AssertionError("expected migration to reject duplicate external identifiers")

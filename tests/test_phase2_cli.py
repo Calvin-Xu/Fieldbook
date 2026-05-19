@@ -80,6 +80,42 @@ def create_run(ledger: Path, experiment_id: str) -> str:
     return data["id"]
 
 
+def test_run_add_parent_run_validation(tmp_path):
+    ledger = init_ledger(tmp_path)
+    experiment_id = create_experiment(ledger)
+    parent_id = create_run(ledger, experiment_id)
+
+    child = payload(
+        run_fieldbook(
+            ledger,
+            "run",
+            "add",
+            "--name",
+            "child-run",
+            "--experiment",
+            experiment_id,
+            "--parent-run",
+            parent_id,
+        )
+    )
+    assert child["parent_run_id"] == parent_id
+
+    missing_parent = run_fieldbook(
+        ledger,
+        "run",
+        "add",
+        "--name",
+        "bad-child",
+        "--experiment",
+        experiment_id,
+        "--parent-run",
+        "run_missing",
+        check=False,
+    )
+    assert missing_parent.returncode == ExitCode.VALIDATION_ERROR
+    assert "parent_run_id" in missing_parent.stderr
+
+
 def test_experiment_run_job_note_status_flow(tmp_path):
     ledger = init_ledger(tmp_path)
     experiment_id = create_experiment(ledger)

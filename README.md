@@ -133,6 +133,12 @@ RUN_ID=$(uv run fieldbook run add \
   --attr marin.mixture=proportional \
   --json | python -c 'import json,sys; print(json.load(sys.stdin)["id"])')
 
+uv run fieldbook run add \
+  --experiment "$EXP_ID" \
+  --name run_00097_followup_eval \
+  --parent-run "$RUN_ID" \
+  --json
+
 JOB_ID=$(uv run fieldbook job add \
   --run "$RUN_ID" \
   --name train \
@@ -209,6 +215,39 @@ uv run fieldbook reconcile file \
   --source "manual-eval-refresh" \
   --apply \
   --json
+```
+
+Reconcile manifests default to upsert. Rows for runs, jobs, artifacts, metrics,
+and notes can set `_op: "archive"` to soft-archive an existing row. `_op:
+"delete"` is intentionally rejected. Manifests can also append external sync
+events, which is useful for recording follow-up W&B, Iris, or artifact refresh
+attempts without making those systems the ledger source of truth:
+
+```json
+{
+  "jobs": [
+    {
+      "id": "job_...",
+      "_op": "archive"
+    }
+  ],
+  "sync_events": [
+    {
+      "target_system": "wandb",
+      "target_identifier": "run-id",
+      "status": "synced",
+      "idempotency_key": "followup-eval-sync-1"
+    }
+  ]
+}
+```
+
+Inspect reconcile history and per-operation audit rows:
+
+```bash
+uv run fieldbook reconcile log --json
+uv run fieldbook reconcile log --event "$RECONCILE_EVENT_ID" --json
+uv run fieldbook reconcile log --source "manual-eval-refresh" --operations --json
 ```
 
 Export collaborator-ready tables:

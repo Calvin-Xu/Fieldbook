@@ -48,5 +48,18 @@
       "note_type": "research",
       "body": "Fixture demonstrates a training run receiving follow-up eval metrics."
     }
+  ],
+  "sync_events": [
+    {
+      "target_system": "wandb",
+      "target_identifier": "fixture-wandb-run",
+      "status": "synced",
+      "run_id": "run_marin_eval_fixture",
+      "job_id": "job_marin_eval_fixture",
+      "idempotency_key": "fixture-wandb-eval-sync",
+      "attrs": {
+        "fixture.name": "marin-eval-completion"
+      }
+    }
   ]
 }

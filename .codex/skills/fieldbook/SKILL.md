@@ -67,6 +67,7 @@ Record a run and job:
 
 ```bash
 uv run fieldbook run add --experiment "$EXP_ID" --name "$RUN_NAME" --json
+uv run fieldbook run add --experiment "$EXP_ID" --name "$DERIVED_RUN" --parent-run "$RUN_ID" --json
 uv run fieldbook job add --run "$RUN_ID" --status running --launcher iris --external-system iris --external-id "$JOB_PATH" --json
 ```
 
@@ -102,6 +103,31 @@ uv run fieldbook reconcile file --experiment "$EXP_ID" --path manifest.json --so
 ```
 
 Dry-run first for ambiguous or large updates. Apply is atomic for one manifest.
+Reconcile rows default to `_op=upsert`; use `_op=archive` for soft-archiving
+existing runs, jobs, artifacts, metrics, or notes. Never use `_op=delete`:
+Fieldbook rejects destructive deletes. Include `sync_events` entries when a
+refresh touches an external system such as W&B, Iris, GCS, or a dashboard:
+
+```json
+{
+  "sync_events": [
+    {
+      "target_system": "wandb",
+      "target_identifier": "run-id",
+      "status": "synced",
+      "idempotency_key": "followup-eval-sync-1"
+    }
+  ]
+}
+```
+
+Use the reconcile log when debugging refreshes:
+
+```bash
+uv run fieldbook reconcile log --json
+uv run fieldbook reconcile log --event "$RECONCILE_EVENT_ID" --json
+uv run fieldbook reconcile log --source iris-refresh --operations --json
+```
 
 ## Export Collaborator Tables
 

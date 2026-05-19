@@ -191,6 +191,7 @@ class Repository:
         status: str,
         external_system: str | None,
         external_id: str | None,
+        parent_run_ref: str | None,
         attrs: dict[str, Any],
         update_existing: bool,
     ) -> dict[str, Any]:
@@ -202,20 +203,34 @@ class Repository:
                 f"run external identifier {external_system}:{external_id} already exists as {existing['id']}"
             )
         experiment_id = self._active_experiment_id(experiment_ref) if experiment_ref else None
+        parent_run_id = self._parent_run_id(parent_run_ref)
+        if existing and parent_run_id == existing["id"]:
+            raise ValidationError("parent_run_id cannot reference the run itself")
         with self.conn:
             if existing:
                 run_id = existing["id"]
                 self.conn.execute(
-                    "UPDATE runs SET name = ?, description = ?, status = ?, updated_at = ?, attrs_json = ? "
-                    "WHERE id = ?",
-                    (name, description, status, now, attrs_json(attrs), run_id),
+                    "UPDATE runs SET name = ?, description = ?, status = ?, "
+                    "parent_run_id = COALESCE(?, parent_run_id), updated_at = ?, attrs_json = ? WHERE id = ?",
+                    (name, description, status, parent_run_id, now, attrs_json(attrs), run_id),
                 )
             else:
                 run_id = new_id("run")
                 self.conn.execute(
-                    "INSERT INTO runs (id, name, description, status, external_system, external_id, created_at, "
-                    "updated_at, attrs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (run_id, name, description, status, external_system, external_id, now, now, attrs_json(attrs)),
+                    "INSERT INTO runs (id, name, description, status, external_system, external_id, parent_run_id, "
+                    "created_at, updated_at, attrs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        run_id,
+                        name,
+                        description,
+                        status,
+                        external_system,
+                        external_id,
+                        parent_run_id,
+                        now,
+                        now,
+                        attrs_json(attrs),
+                    ),
                 )
             if experiment_id:
                 self._link_run_ids(experiment_id, run_id)
@@ -854,6 +869,22 @@ class Repository:
         if experiment["deleted_at"] is not None:
             raise ValidationError(f"experiment is archived/deleted and cannot be mutated: {experiment['id']}")
         return experiment["id"]
+
+    def _parent_run_id(self, ref: str | None) -> str | None:
+        if ref is None:
+            return None
+        row = self.conn.execute("SELECT id FROM runs WHERE id = ?", (ref,)).fetchone()
+        if row is None:
+            rows = self.conn.execute(
+                "SELECT id FROM runs WHERE name = ? AND deleted_at IS NULL ORDER BY id",
+                (ref,),
+            ).fetchall()
+            if len(rows) == 1:
+                return rows[0]["id"]
+            if len(rows) > 1:
+                raise ValidationError(f"parent_run_id reference {ref!r} matches multiple runs")
+            raise ValidationError(f"parent_run_id does not reference an existing run: {ref}")
+        return row["id"]
 
     def _experiment_artifact_rows(self, experiment_id: str, *, limit: int) -> list[sqlite3.Row]:
         return self.conn.execute(

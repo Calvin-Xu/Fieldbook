@@ -1,0 +1,29 @@
+{
+  "jobs": [
+    {
+      "id": "job_marin_eval_fixture",
+      "_op": "archive"
+    }
+  ],
+  "notes": [
+    {
+      "id": "note_marin_eval_fixture",
+      "_op": "archive",
+      "entity_type": "run",
+      "entity_id": "run_marin_eval_fixture",
+      "note_type": "research"
+    }
+  ],
+  "sync_events": [
+    {
+      "target_system": "iris",
+      "target_identifier": "/calvinxu/fixture-english-lite",
+      "status": "skipped",
+      "job_id": "job_marin_eval_fixture",
+      "idempotency_key": "fixture-iris-archive-sync",
+      "attrs": {
+        "fixture.name": "reconcile-hardening"
+      }
+    }
+  ]
+}

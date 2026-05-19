@@ -8,7 +8,7 @@ from fieldbook.errors import LedgerBusyError, NotFoundError, ValidationError
 
 
 DEFAULT_LEDGER_RELATIVE_PATH = Path(".experiments") / "ledger.sqlite"
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 
 
 def _parents_inclusive(path: Path) -> list[Path]:
@@ -129,6 +129,7 @@ def apply_migrations(conn: sqlite3.Connection, *, allow_newer_readonly: bool = F
                 f"ledger schema version {current} is newer than supported version {CURRENT_SCHEMA_VERSION}"
             )
         for version in range(current + 1, CURRENT_SCHEMA_VERSION + 1):
+            _preflight_migration(conn, version)
             _execute_sql_script(conn, _migration_sql(version))
             conn.execute("PRAGMA user_version = %d" % version)
             conn.execute(
@@ -141,6 +142,23 @@ def apply_migrations(conn: sqlite3.Connection, *, allow_newer_readonly: bool = F
         raise
     else:
         conn.commit()
+
+
+def _preflight_migration(conn: sqlite3.Connection, version: int) -> None:
+    if version != 5:
+        return
+    conflicts: list[str] = []
+    for table in ("runs", "jobs"):
+        rows = conn.execute(
+            f"SELECT external_system, external_id, GROUP_CONCAT(id, ', ') AS ids "
+            f"FROM {table} WHERE deleted_at IS NULL AND external_system IS NOT NULL "
+            f"AND external_id IS NOT NULL GROUP BY external_system, external_id HAVING COUNT(*) > 1"
+        ).fetchall()
+        for row in rows:
+            conflicts.append(f"{table} {row['external_system']}:{row['external_id']} -> {row['ids']}")
+    if conflicts:
+        details = "; ".join(conflicts)
+        raise ValidationError(f"duplicate active external identifiers block schema migration 5: {details}")
 
 
 def init_ledger(path: Path) -> Path:

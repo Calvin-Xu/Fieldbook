@@ -304,6 +304,358 @@ def test_reconcile_file_dry_run_apply_and_atomic_failure(tmp_path):
     assert failed.returncode != 0
     missing = run_fieldbook(ledger, "run", "show", "run_bad", check=False)
     assert missing.returncode != 0
+    conn = sqlite3.connect(ledger)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM reconcile_events").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM reconcile_operations WHERE entity = 'runs' AND entity_id = 'run_bad'").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_reconcile_archive_sync_audit_log_and_manifest_dedupe(tmp_path):
+    ledger = init_ledger(tmp_path)
+    experiment_id = create_experiment(ledger)
+    long_body = "A" * 5000
+    manifest_path = tmp_path / "hardening.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "runs": [
+                    {
+                        "name": "dedupe-first",
+                        "external_system": "wandb",
+                        "external_id": "dedupe",
+                    },
+                    {
+                        "name": "dedupe-second",
+                        "external_system": "wandb",
+                        "external_id": "dedupe",
+                        "description": "last row wins",
+                    },
+                ],
+                "notes": [
+                    {
+                        "id": "note_long",
+                        "entity_type": "experiment",
+                        "entity_id": experiment_id,
+                        "note_type": "research",
+                        "body": long_body,
+                    }
+                ],
+                "sync_events": [
+                    {
+                        "target_system": "wandb",
+                        "target_identifier": "run-dedupe",
+                        "status": "synced",
+                        "idempotency_key": "wandb-sync-1",
+                        "attrs": {"wandb.project": "fieldbook"},
+                    }
+                ],
+            }
+        )
+    )
+
+    applied = payload(
+        run_fieldbook(
+            ledger,
+            "reconcile",
+            "file",
+            "--path",
+            str(manifest_path),
+            "--source",
+            "hardening",
+            "--experiment",
+            experiment_id,
+            "--apply",
+        )
+    )
+    assert applied["counts"]["insert"] == {"notes": 1, "runs": 1}
+    assert applied["counts"]["sync_event"] == 1
+    assert applied["counts"]["total"] == 3
+
+    runs = payload(run_fieldbook(ledger, "run", "list", "--experiment", experiment_id, "--verbose"))
+    assert len(runs) == 1
+    assert runs[0]["name"] == "dedupe-second"
+    assert runs[0]["description"] == "last row wins"
+
+    log = payload(run_fieldbook(ledger, "reconcile", "log"))
+    assert log["events"][0]["source"] == "hardening"
+    assert log["events"][0]["counts"]["sync_event"] == 1
+    event_id = log["events"][0]["id"]
+
+    event = payload(run_fieldbook(ledger, "reconcile", "log", "--event", event_id))
+    actions = {(op["entity"], op["action"]) for op in event["operations"]}
+    assert ("runs", "insert") in actions
+    assert ("notes", "insert") in actions
+    assert ("sync_events", "sync_event") in actions
+    note_input = next(op["input"] for op in event["operations"] if op["entity"] == "notes")
+    assert note_input["body"]["byte_count"] == 5000
+    assert note_input["body"]["sha256"]
+    assert note_input["body"]["preview"] == "A" * 200
+    assert "A" * 500 not in json.dumps(note_input)
+
+    conn = sqlite3.connect(ledger)
+    conn.row_factory = sqlite3.Row
+    try:
+        sync = conn.execute("SELECT * FROM sync_events").fetchone()
+        assert sync["reconcile_event_id"] == event_id
+        assert sync["idempotency_key"] == "wandb-sync-1"
+        assert json.loads(sync["attrs_json"]) == {"wandb.project": "fieldbook"}
+    finally:
+        conn.close()
+
+
+def test_reconcile_archive_delete_rejection_and_sync_idempotency(tmp_path):
+    ledger = init_ledger(tmp_path)
+    experiment_id = create_experiment(ledger)
+    run_id = create_run(ledger, experiment_id)
+
+    archive_path = tmp_path / "archive.json"
+    note_id = payload(
+        run_fieldbook(
+            ledger,
+            "note",
+            "add",
+            "--entity-type",
+            "experiment",
+            "--entity-id",
+            experiment_id,
+            "--type",
+            "research",
+            "--body",
+            "Archive me",
+        )
+    )["id"]
+    archive_path.write_text(
+        json.dumps(
+            {
+                "runs": [{"id": run_id, "_op": "archive"}],
+                "notes": [{"id": note_id, "_op": "archive"}],
+            }
+        )
+    )
+    archived = payload(
+        run_fieldbook(
+            ledger,
+            "reconcile",
+            "file",
+            "--path",
+            str(archive_path),
+            "--source",
+            "archive",
+            "--experiment",
+            experiment_id,
+            "--apply",
+        )
+    )
+    assert archived["counts"]["archive"] == {"notes": 1, "runs": 1}
+    assert payload(run_fieldbook(ledger, "run", "list", "--experiment", experiment_id)) == []
+    assert payload(run_fieldbook(ledger, "note", "list", "--entity-type", "experiment", "--entity-id", experiment_id)) == []
+
+    archived_again = payload(
+        run_fieldbook(
+            ledger,
+            "reconcile",
+            "file",
+            "--path",
+            str(archive_path),
+            "--source",
+            "archive-again",
+            "--experiment",
+            experiment_id,
+            "--apply",
+        )
+    )
+    assert archived_again["counts"]["noop"] == {"notes": 1, "runs": 1}
+
+    delete_path = tmp_path / "delete.json"
+    delete_path.write_text(json.dumps({"runs": [{"id": run_id, "_op": "delete"}]}))
+    deleted = run_fieldbook(
+        ledger,
+        "reconcile",
+        "file",
+        "--path",
+        str(delete_path),
+        "--source",
+        "delete",
+        "--experiment",
+        experiment_id,
+        "--apply",
+        check=False,
+    )
+    assert deleted.returncode != 0
+    assert "delete" in deleted.stderr
+
+    sync_path = tmp_path / "sync.json"
+    sync_path.write_text(
+        json.dumps(
+            {
+                "sync_events": [
+                    {
+                        "target_system": "wandb",
+                        "target_identifier": "same",
+                        "status": "synced",
+                        "idempotency_key": "same-key",
+                    }
+                ]
+            }
+        )
+    )
+    first_sync = payload(
+        run_fieldbook(ledger, "reconcile", "file", "--path", str(sync_path), "--source", "sync", "--apply")
+    )
+    assert first_sync["counts"]["sync_event"] == 1
+    second_sync = payload(
+        run_fieldbook(ledger, "reconcile", "file", "--path", str(sync_path), "--source", "sync", "--apply")
+    )
+    assert second_sync["counts"]["sync_event"] == 0
+    assert second_sync["counts"]["noop"] == {"sync_events": 1}
+
+    sync_without_target_path = tmp_path / "sync_without_target.json"
+    sync_without_target_path.write_text(
+        json.dumps(
+            {
+                "sync_events": [
+                    {
+                        "target_system": "wandb",
+                        "status": "failed",
+                        "idempotency_key": "missing-target-key",
+                    }
+                ]
+            }
+        )
+    )
+    first_no_target = payload(
+        run_fieldbook(
+            ledger,
+            "reconcile",
+            "file",
+            "--path",
+            str(sync_without_target_path),
+            "--source",
+            "sync-no-target",
+            "--apply",
+        )
+    )
+    second_no_target = payload(
+        run_fieldbook(
+            ledger,
+            "reconcile",
+            "file",
+            "--path",
+            str(sync_without_target_path),
+            "--source",
+            "sync-no-target",
+            "--apply",
+        )
+    )
+    assert first_no_target["counts"]["sync_event"] == 1
+    assert second_no_target["counts"]["sync_event"] == 0
+    assert second_no_target["counts"]["noop"] == {"sync_events": 1}
+
+
+def test_reconcile_parent_run_validation_and_noop_update(tmp_path):
+    ledger = init_ledger(tmp_path)
+    experiment_id = create_experiment(ledger)
+    parent_id = create_run(ledger, experiment_id)
+    child_path = tmp_path / "child.json"
+    child_path.write_text(
+        json.dumps(
+            {
+                "runs": [
+                    {
+                        "id": "run_child",
+                        "name": "child",
+                        "parent_run_id": parent_id,
+                    }
+                ]
+            }
+        )
+    )
+    applied = payload(
+        run_fieldbook(
+            ledger,
+            "reconcile",
+            "file",
+            "--path",
+            str(child_path),
+            "--experiment",
+            experiment_id,
+            "--apply",
+        )
+    )
+    assert applied["counts"]["insert"] == {"runs": 1}
+    assert payload(run_fieldbook(ledger, "run", "show", "run_child"))["parent_run_id"] == parent_id
+
+    noop = payload(
+        run_fieldbook(
+            ledger,
+            "reconcile",
+            "file",
+            "--path",
+            str(child_path),
+            "--experiment",
+            experiment_id,
+            "--apply",
+        )
+    )
+    assert noop["counts"]["noop"] == {"runs": 1}
+
+    bad_parent_path = tmp_path / "bad_parent.json"
+    bad_parent_path.write_text(
+        json.dumps({"runs": [{"id": "run_bad_parent", "name": "bad", "parent_run_id": "run_missing"}]})
+    )
+    bad_parent = run_fieldbook(
+        ledger,
+        "reconcile",
+        "file",
+        "--path",
+        str(bad_parent_path),
+        "--experiment",
+        experiment_id,
+        "--apply",
+        check=False,
+    )
+    assert bad_parent.returncode != 0
+    assert "parent_run_id" in bad_parent.stderr
+
+    self_parent_path = tmp_path / "self_parent.json"
+    self_parent_path.write_text(json.dumps({"runs": [{"id": "run_self", "name": "self", "parent_run_id": "run_self"}]}))
+    self_parent = run_fieldbook(
+        ledger,
+        "reconcile",
+        "file",
+        "--path",
+        str(self_parent_path),
+        "--experiment",
+        experiment_id,
+        "--apply",
+        check=False,
+    )
+    assert self_parent.returncode != 0
+    assert "parent_run_id" in self_parent.stderr
+
+
+def test_reconcile_note_upsert_requires_note_fields(tmp_path):
+    ledger = init_ledger(tmp_path)
+    experiment_id = create_experiment(ledger)
+    bad_note_path = tmp_path / "bad_note.json"
+    bad_note_path.write_text(json.dumps({"notes": [{"id": "note_missing_fields", "body": "Missing fields"}]}))
+
+    result = run_fieldbook(
+        ledger,
+        "reconcile",
+        "file",
+        "--path",
+        str(bad_note_path),
+        "--experiment",
+        experiment_id,
+        "--apply",
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "entity_type" in result.stderr
 
 
 def test_reconcile_note_defaults_and_body_validation(tmp_path):

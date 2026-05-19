@@ -9,7 +9,7 @@ from fieldbook.db import connect, discover_ledger, init_ledger, resolve_init_pat
 from fieldbook.errors import ExitCode, FieldbookError, LedgerBusyError, NotFoundError, ValidationError
 from fieldbook.output import emit
 from fieldbook.repository import Repository, note_body_preview
-from fieldbook.reconcile import load_manifest, reconcile_manifest
+from fieldbook.reconcile import load_manifest, reconcile_log, reconcile_manifest
 from fieldbook.validation import NOTE_BODY_FORMATS, parse_attrs, validate_metric_value
 
 
@@ -54,7 +54,9 @@ def _is_read_only(args: argparse.Namespace) -> bool:
     if command == "note":
         return getattr(args, "note_command", None) in {"list", "show"}
     if command == "reconcile":
-        return getattr(args, "reconcile_command", None) == "file" and not getattr(args, "apply", False)
+        return getattr(args, "reconcile_command", None) == "log" or (
+            getattr(args, "reconcile_command", None) == "file" and not getattr(args, "apply", False)
+        )
     if command == "export":
         return getattr(args, "export_command", None) == "coverage" and not getattr(args, "output", None)
     return False
@@ -110,6 +112,7 @@ def _run_add(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
         status=args.status,
         external_system=args.external_system,
         external_id=args.external_id,
+        parent_run_ref=args.parent_run,
         attrs=parse_attrs(args.attr),
         update_existing=args.update_existing,
     )
@@ -288,6 +291,18 @@ def _reconcile_file(args: argparse.Namespace, repo: Repository) -> dict[str, Any
         source=args.source or args.path,
         experiment_ref=args.experiment,
         apply=args.apply,
+    )
+
+
+def _reconcile_log(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return reconcile_log(
+        repo.conn,
+        event_id=args.event,
+        source=args.source,
+        since=args.since,
+        before=args.before,
+        limit=args.limit,
+        include_operations=args.operations,
     )
 
 
@@ -564,6 +579,7 @@ def _add_run_parsers(subparsers: argparse._SubParsersAction) -> None:
     add.add_argument("--name", required=True)
     add.add_argument("--description")
     add.add_argument("--experiment")
+    add.add_argument("--parent-run")
     add.add_argument("--status", default="active")
     _add_external_options(add)
     _add_attr_option(add)
@@ -764,6 +780,16 @@ def _add_reconcile_parsers(subparsers: argparse._SubParsersAction) -> None:
     file_parser.add_argument("--experiment")
     file_parser.add_argument("--apply", action="store_true")
     file_parser.set_defaults(func=_repo_command(_reconcile_file))
+
+    log_parser = commands.add_parser("log")
+    _common_repo_parser(log_parser)
+    log_parser.add_argument("--event")
+    log_parser.add_argument("--source")
+    log_parser.add_argument("--since")
+    log_parser.add_argument("--before")
+    log_parser.add_argument("--limit", type=int, default=20)
+    log_parser.add_argument("--operations", action="store_true")
+    log_parser.set_defaults(func=_repo_command(_reconcile_log))
 
 
 def _add_export_parsers(subparsers: argparse._SubParsersAction) -> None:

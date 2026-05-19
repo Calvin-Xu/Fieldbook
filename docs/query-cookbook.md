@@ -28,10 +28,19 @@ FROM v_artifact_latest_per_type_v1
 ORDER BY experiment_id, run_id, type;
 ```
 
+## Redacted Artifacts For Shared Views
+
+```sql
+SELECT artifact_id, experiment_id, type, uri_locality, display_uri, updated_at
+FROM v_artifacts_redacted_v1
+ORDER BY updated_at DESC
+LIMIT 100;
+```
+
 ## Metric Coverage
 
 ```sql
-SELECT experiment_id, metric_name, run_count, missing_run_count
+SELECT experiment_id, metric_name, run_count, total_runs, coverage
 FROM v_metric_coverage_v1
 ORDER BY metric_name;
 ```

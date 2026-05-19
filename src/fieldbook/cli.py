@@ -55,7 +55,14 @@ def _with_repo(args: argparse.Namespace, command: Command) -> int:
 def _is_read_only(args: argparse.Namespace) -> bool:
     command = getattr(args, "command", None)
     if command == "experiment":
-        return getattr(args, "experiment_command", None) in {"list", "show", "status", "context"}
+        return getattr(args, "experiment_command", None) in {
+            "list",
+            "show",
+            "status",
+            "context",
+            "triage",
+            "closeout-checklist",
+        }
     if command == "run":
         return getattr(args, "run_command", None) in {"list", "show"}
     if command == "job":
@@ -137,6 +144,36 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         raise ValidationError(str(exc)) from exc
     emit(envelope, json_output=args.json, text=format_doctor_text(envelope))
     return ExitCode.VALIDATION_ERROR if doctor_failed(envelope, strict=args.strict) else ExitCode.SUCCESS
+
+
+def _cmd_experiment_triage(args: argparse.Namespace) -> int:
+    ledger_path = discover_ledger(ledger=args.ledger)
+    conn = connect(ledger_path, allow_newer_readonly=True)
+    try:
+        repo = Repository(conn)
+        status = repo.experiment_status(args.experiment, stale_hours=args.stale_hours)
+        experiment_id = status["experiment"]["id"]
+        doctor = run_doctor(ledger_path, check_ids=None, stale_hours=args.stale_hours, cwd=Path.cwd())
+        payload = _triage_payload(conn, status, doctor, experiment_id)
+    finally:
+        conn.close()
+    emit(payload, json_output=args.json, text=_format_triage_markdown(payload))
+    return ExitCode.SUCCESS
+
+
+def _cmd_experiment_closeout_checklist(args: argparse.Namespace) -> int:
+    ledger_path = discover_ledger(ledger=args.ledger)
+    conn = connect(ledger_path, allow_newer_readonly=True)
+    try:
+        repo = Repository(conn)
+        status = repo.experiment_status(args.experiment, stale_hours=args.stale_hours)
+        experiment_id = status["experiment"]["id"]
+        doctor = run_doctor(ledger_path, check_ids=None, stale_hours=args.stale_hours, cwd=Path.cwd())
+        payload = _closeout_payload(conn, status, doctor, experiment_id)
+    finally:
+        conn.close()
+    emit(payload, json_output=args.json, text=_format_closeout_markdown(payload))
+    return ExitCode.SUCCESS
 
 
 def _snapshot_export(args: argparse.Namespace) -> int:
@@ -226,6 +263,142 @@ def _writeback_log(args: argparse.Namespace, repo: Repository) -> dict[str, Any]
         source_entity_id=args.source_entity,
         limit=args.limit,
     )
+
+
+def _triage_payload(
+    conn: sqlite3.Connection,
+    status: dict[str, Any],
+    doctor: dict[str, Any],
+    experiment_id: str,
+) -> dict[str, Any]:
+    failed_jobs = status["failed_jobs"]
+    stale_jobs = status["stale_jobs"]
+    debug_notes = status["notes"]["open_debug"]
+    actions: list[str] = []
+    if failed_jobs:
+        actions.append("Inspect failed jobs and attach a debug note with the recovery path.")
+    if stale_jobs:
+        actions.append("Refresh or reconcile stale queued/running jobs.")
+    if debug_notes:
+        actions.append("Resolve or update open debug notes.")
+    if doctor["issue_count"]:
+        actions.append("Run `fieldbook doctor --json` and address reported ledger issues.")
+    if not actions:
+        actions.append("No urgent triage items found; continue with the next planned analysis step.")
+    return {
+        "experiment": status["experiment"],
+        "failed_jobs": failed_jobs,
+        "stale_jobs": stale_jobs,
+        "unresolved_debug_notes": debug_notes,
+        "key_artifacts": _redacted_artifacts(conn, experiment_id, limit=20),
+        "doctor_ok": doctor["ok"],
+        "doctor_issue_count": doctor["issue_count"],
+        "suggested_next_actions": actions,
+    }
+
+
+def _closeout_payload(
+    conn: sqlite3.Connection,
+    status: dict[str, Any],
+    doctor: dict[str, Any],
+    experiment_id: str,
+) -> dict[str, Any]:
+    failed_count = len(status["failed_jobs"])
+    stale_count = len(status["stale_jobs"])
+    unresolved_notes = sum(
+        len(status["notes"][key])
+        for key in ("open_handoffs", "open_next_actions", "open_debug")
+    )
+    metric_table_count = conn.execute(
+        "SELECT COUNT(*) FROM v_artifacts_redacted_v1 WHERE experiment_id = ? AND type = 'metric-table'",
+        (experiment_id,),
+    ).fetchone()[0]
+    decision_count = conn.execute(
+        "SELECT COUNT(*) FROM notes WHERE entity_type = 'experiment' AND entity_id = ? "
+        "AND note_type = 'decision' AND deleted_at IS NULL",
+        (experiment_id,),
+    ).fetchone()[0]
+    items = [
+        _checklist_item("doctor", "Doctor clean", bool(doctor["ok"]), f"{doctor['issue_count']} issue(s)"),
+        _checklist_item("failed_jobs", "No failed jobs", failed_count == 0, f"{failed_count} failed job(s)"),
+        _checklist_item("stale_jobs", "No stale active jobs", stale_count == 0, f"{stale_count} stale job(s)"),
+        _checklist_item(
+            "unresolved_notes",
+            "No open handoff/next-action/debug notes",
+            unresolved_notes == 0,
+            f"{unresolved_notes} open note(s)",
+        ),
+        _checklist_item(
+            "metric_table_export",
+            "Metric-table export present",
+            metric_table_count > 0,
+            f"{metric_table_count} metric-table artifact(s)",
+        ),
+        _checklist_item(
+            "decision_note",
+            "Final decision note present",
+            decision_count > 0,
+            f"{decision_count} decision note(s)",
+        ),
+    ]
+    return {"experiment": status["experiment"], "items": items, "ready": all(item["ok"] for item in items)}
+
+
+def _checklist_item(item_id: str, label: str, ok: bool, detail: str) -> dict[str, Any]:
+    return {"id": item_id, "label": label, "ok": ok, "detail": detail}
+
+
+def _redacted_artifacts(conn: sqlite3.Connection, experiment_id: str, *, limit: int) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT * FROM v_artifacts_redacted_v1 WHERE experiment_id = ? ORDER BY updated_at DESC, artifact_id DESC LIMIT ?",
+        (experiment_id, limit),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _format_triage_markdown(payload: dict[str, Any]) -> str:
+    lines = [f"# Fieldbook Triage: {payload['experiment']['name']}", ""]
+    lines.append(f"Doctor: {'ok' if payload['doctor_ok'] else 'issues'} ({payload['doctor_issue_count']} issue(s))")
+    lines.extend(["", "## Failed Jobs"])
+    lines.extend(_job_lines(payload["failed_jobs"]))
+    lines.extend(["", "## Stale Jobs"])
+    lines.extend(_job_lines(payload["stale_jobs"]))
+    lines.extend(["", "## Open Debug Notes"])
+    lines.extend(_note_lines(payload["unresolved_debug_notes"]))
+    lines.extend(["", "## Key Artifacts"])
+    lines.extend(_artifact_lines(payload["key_artifacts"]))
+    lines.extend(["", "## Suggested Next Actions"])
+    lines.extend(f"- {action}" for action in payload["suggested_next_actions"])
+    return "\n".join(lines)
+
+
+def _format_closeout_markdown(payload: dict[str, Any]) -> str:
+    lines = [f"# Fieldbook Closeout Checklist: {payload['experiment']['name']}", ""]
+    for item in payload["items"]:
+        mark = "x" if item["ok"] else " "
+        lines.append(f"- [{mark}] {item['label']} ({item['detail']})")
+    return "\n".join(lines)
+
+
+def _job_lines(jobs: list[dict[str, Any]]) -> list[str]:
+    if not jobs:
+        return ["- none"]
+    return [f"- `{job['id']}` {job.get('name') or '(unnamed)'}: {job['status']}" for job in jobs]
+
+
+def _note_lines(notes: list[dict[str, Any]]) -> list[str]:
+    if not notes:
+        return ["- none"]
+    return [f"- `{note['id']}` {note.get('title') or note['note_type']}" for note in notes]
+
+
+def _artifact_lines(artifacts: list[dict[str, Any]]) -> list[str]:
+    if not artifacts:
+        return ["- none"]
+    return [
+        f"- `{artifact['artifact_id']}` {artifact['type']}: {artifact['display_uri']}"
+        for artifact in artifacts
+    ]
 
 
 def _experiment_create(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
@@ -783,6 +956,18 @@ def _add_experiment_parsers(subparsers: argparse._SubParsersAction) -> None:
     context.add_argument("experiment")
     context.add_argument("--stale-hours", type=float, default=24.0)
     context.set_defaults(func=_repo_command(_experiment_context))
+
+    triage = commands.add_parser("triage")
+    _add_common_options(triage)
+    triage.add_argument("experiment")
+    triage.add_argument("--stale-hours", type=float, default=24.0)
+    triage.set_defaults(func=_cmd_experiment_triage)
+
+    closeout = commands.add_parser("closeout-checklist")
+    _add_common_options(closeout)
+    closeout.add_argument("experiment")
+    closeout.add_argument("--stale-hours", type=float, default=24.0)
+    closeout.set_defaults(func=_cmd_experiment_closeout_checklist)
 
     archive = commands.add_parser("archive")
     _common_repo_parser(archive)

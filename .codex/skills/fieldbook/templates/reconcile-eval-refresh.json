@@ -1,0 +1,27 @@
+{
+  "artifacts": [
+    {
+      "run_id": "<RUN_ID>",
+      "job_id": "<JOB_ID>",
+      "type": "eval-result",
+      "uri": "<ARTIFACT_URI>"
+    }
+  ],
+  "metrics": [
+    {
+      "run_id": "<RUN_ID>",
+      "metric_name": "<METRIC_NAME>",
+      "value": 0.0,
+      "source_job_id": "<JOB_ID>"
+    }
+  ],
+  "notes": [
+    {
+      "entity_type": "experiment",
+      "entity_id": "<EXPERIMENT_ID>",
+      "note_type": "research",
+      "title": "Eval refresh",
+      "body": "<NOTE_BODY>"
+    }
+  ]
+}

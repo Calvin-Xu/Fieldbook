@@ -46,6 +46,7 @@ command or subcommand: `fieldbook experiment list --ledger <path> --json`.
 uv run fieldbook experiment list --json
 uv run fieldbook experiment status "$EXP_ID" --json
 uv run fieldbook experiment context "$EXP_ID"
+uv run fieldbook experiment triage "$EXP_ID" --json
 ```
 
 Use the status payload to identify stale running jobs, failed jobs, key
@@ -173,6 +174,23 @@ Inspect history with:
 ```bash
 uv run fieldbook writeback log --target-system wandb --json
 ```
+
+## Workflow Recipes And Dashboard Readiness
+
+Use read-only workflow summaries before deciding on side effects:
+
+```bash
+uv run fieldbook experiment triage "$EXP_ID" --json
+uv run fieldbook experiment closeout-checklist "$EXP_ID" --json
+```
+
+Workflow recipes live in `.codex/skills/fieldbook/references/workflows/`.
+Templates live in `.codex/skills/fieldbook/templates/`. Treat them as editable
+scaffolds; dry-run generated manifests before apply.
+
+Dashboard readiness docs live in `docs/dashboard-readiness/`. Use
+`v_artifacts_redacted_v1` for shared artifact displays and `v_artifacts_v1` only
+when a local agent needs raw provenance.
 
 Use adapters when the external system state is already available as a local
 snapshot. Adapters are pure translators: they never read or mutate the ledger.

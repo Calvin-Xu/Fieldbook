@@ -162,7 +162,7 @@ JOB_ID=$(uv run fieldbook job add \
 uv run fieldbook artifact add \
   --run "$RUN_ID" \
   --type checkpoint \
-  --uri gs://example/checkpoints/step-100 \
+  --uri "<ARTIFACT_URI>" \
   --json
 
 uv run fieldbook metric add \
@@ -187,6 +187,7 @@ Context-switch back to the experiment from any subdirectory:
 ```bash
 uv run fieldbook experiment status "$EXP_ID" --json
 uv run fieldbook experiment context "$EXP_ID"
+uv run fieldbook experiment triage "$EXP_ID" --json
 ```
 
 `status` is the compact navigation surface for agents: counts, failed/stale
@@ -297,6 +298,30 @@ Inspect writeback history with:
 ```bash
 uv run fieldbook writeback log --target-system wandb --json
 ```
+
+## Workflow Packs
+
+Fieldbook includes read-only workflow summaries and agent-editable scaffolds.
+Use triage when resuming active work:
+
+```bash
+uv run fieldbook experiment triage "$EXP_ID" --json
+```
+
+Use closeout checklist when an experiment appears complete:
+
+```bash
+uv run fieldbook experiment closeout-checklist "$EXP_ID" --json
+```
+
+Workflow recipes live under
+`.codex/skills/fieldbook/references/workflows/`; reusable manifest and note
+templates live under `.codex/skills/fieldbook/templates/`. These files are
+scaffolds. Inspect and dry-run before applying any reconcile or writeback step.
+
+Dashboard readiness is documented in `docs/dashboard-readiness/contract.md`.
+Dashboard/shared artifact listings should use `v_artifacts_redacted_v1` by
+default so local filesystem paths are rendered as redacted display labels.
 
 Use adapters when external state has already been exported to local files.
 Adapters do not read or write the ledger. They translate snapshots into

@@ -158,6 +158,34 @@ Metric and artifact adapters require ledger IDs. If a snapshot only has
 external run IDs, first run and apply `wandb-runs-json`, query `v_runs_v1` for
 the ledger IDs, then produce the metric or artifact manifest.
 
+## Audit And Portability
+
+Run doctor before trusting stale context, collaborator exports, or a recovered
+ledger:
+
+```bash
+uv run fieldbook doctor --json
+uv run fieldbook doctor --list-checks --json
+uv run fieldbook doctor --check stale-jobs --stale-hours 12 --json
+```
+
+`doctor` is read-only. It returns stable issue codes and suggested next
+actions. If it finds errors, inspect the affected entities with stable SQL views
+or `reconcile log`; do not repair by raw SQL writes. Use `--strict` when warning
+findings should block automation.
+
+Use full-ledger snapshots to move or share the entire local source of truth:
+
+```bash
+uv run fieldbook snapshot export --output /tmp/fieldbook-ledger.sqlite --json
+uv run fieldbook snapshot inspect --input /tmp/fieldbook-ledger.sqlite --json
+uv run fieldbook snapshot import --input /tmp/fieldbook-ledger.sqlite --output /tmp/restored.sqlite --json
+```
+
+Snapshots include notes, archived rows, sync events, local paths, and reconcile
+history. Treat them as sensitive provenance artifacts. For collaborator metric
+tables, prefer `export metrics-long`, `export runs-wide`, or `export coverage`.
+
 ## Query The Ledger
 
 Use stable views for ad hoc analysis and dashboard prototypes:

@@ -276,6 +276,37 @@ Use `--strict` when a refresh should fail on any skipped input row. Adapter
 debug output contains unredacted source rows and should be treated as local
 diagnostic material.
 
+Audit the ledger before trusting a resumed experiment or export:
+
+```bash
+uv run fieldbook doctor --json
+uv run fieldbook doctor --list-checks --json
+uv run fieldbook doctor --check stale-jobs --stale-hours 12 --json
+```
+
+`doctor` is read-only. It reports stable issue codes, severities, affected
+entities, details, and suggested next actions. It exits nonzero for errors;
+`--strict` also exits nonzero for warnings. Use `reconcile log` and stable
+views such as `v_jobs_needing_attention_v1` or `v_reconcile_log_v1` to debug
+specific findings.
+
+Create a portable full-ledger snapshot when moving a ledger or sharing the
+entire provenance database:
+
+```bash
+uv run fieldbook snapshot export --output /tmp/fieldbook-ledger.sqlite --json
+uv run fieldbook snapshot inspect --input /tmp/fieldbook-ledger.sqlite --json
+uv run fieldbook snapshot import \
+  --input /tmp/fieldbook-ledger.sqlite \
+  --output /tmp/restored-ledger.sqlite \
+  --json
+```
+
+Snapshots are full-ledger copies. They include notes, local paths, sync events,
+reconcile history, archived rows, and other provenance that may be sensitive.
+Review before sharing. For collaborator metric tables, prefer `export
+metrics-long`, `export runs-wide`, or `export coverage`.
+
 Inspect the ledger through stable SQL views:
 
 ```bash

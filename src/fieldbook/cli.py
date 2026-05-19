@@ -17,8 +17,10 @@ from fieldbook.adapters import (
 from fieldbook.db import connect, discover_ledger, init_ledger, resolve_init_path
 from fieldbook.errors import ExitCode, FieldbookError, LedgerBusyError, NotFoundError, ValidationError
 from fieldbook.output import emit
+from fieldbook.doctor import doctor_failed, format_doctor_text, list_doctor_checks, run_doctor
 from fieldbook.repository import Repository, note_body_preview
 from fieldbook.reconcile import load_manifest, reconcile_log, reconcile_manifest
+from fieldbook.snapshot import export_snapshot, import_snapshot, inspect_snapshot
 from fieldbook.sql_query import DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_SQL_LIMIT, DEFAULT_SQL_TIMEOUT, execute_readonly_sql, resolve_sql_text
 from fieldbook.validation import NOTE_BODY_FORMATS, parse_attrs, validate_metric_value
 
@@ -111,6 +113,47 @@ def _cmd_sql(args: argparse.Namespace) -> int:
         print(stdout, end="")
     if stderr:
         print(stderr, end="", file=sys.stderr)
+    return ExitCode.SUCCESS
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    if args.list_checks:
+        emit(list_doctor_checks(), json_output=args.json)
+        return ExitCode.SUCCESS
+    ledger_path = discover_ledger(ledger=args.ledger)
+    try:
+        envelope = run_doctor(
+            ledger_path,
+            check_ids=args.check,
+            stale_hours=args.stale_hours,
+            cwd=Path.cwd(),
+        )
+    except ValueError as exc:
+        raise ValidationError(str(exc)) from exc
+    emit(envelope, json_output=args.json, text=format_doctor_text(envelope))
+    return ExitCode.VALIDATION_ERROR if doctor_failed(envelope, strict=args.strict) else ExitCode.SUCCESS
+
+
+def _snapshot_export(args: argparse.Namespace) -> int:
+    ledger_path = discover_ledger(ledger=args.ledger)
+    payload = export_snapshot(
+        ledger_path=ledger_path,
+        output_path=Path(args.output),
+        replace=args.replace,
+        metadata=not args.no_metadata,
+    )
+    emit(payload, json_output=args.json)
+    return ExitCode.SUCCESS
+
+
+def _snapshot_inspect(args: argparse.Namespace) -> int:
+    emit(inspect_snapshot(Path(args.input)), json_output=args.json)
+    return ExitCode.SUCCESS
+
+
+def _snapshot_import(args: argparse.Namespace) -> int:
+    payload = import_snapshot(input_path=Path(args.input), output_path=Path(args.output), replace=args.replace)
+    emit(payload, json_output=args.json)
     return ExitCode.SUCCESS
 
 
@@ -601,9 +644,45 @@ def build_parser() -> argparse.ArgumentParser:
     _add_reconcile_parsers(subparsers)
     _add_export_parsers(subparsers)
     _add_adapter_parsers(subparsers)
+    _add_doctor_parser(subparsers)
+    _add_snapshot_parsers(subparsers)
     _add_db_parsers(subparsers)
     _add_sql_parser(subparsers)
     return parser
+
+
+def _add_doctor_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("doctor", help="Audit Fieldbook ledger health")
+    _add_common_options(parser)
+    parser.add_argument("--check", action="append", default=[])
+    parser.add_argument("--list-checks", action="store_true")
+    parser.add_argument("--stale-hours", type=float, default=24.0)
+    parser.add_argument("--strict", action="store_true")
+    parser.set_defaults(func=_cmd_doctor)
+
+
+def _add_snapshot_parsers(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("snapshot", help="Export, inspect, and import full-ledger snapshots")
+    commands = parser.add_subparsers(dest="snapshot_command", required=True)
+
+    export = commands.add_parser("export")
+    _add_common_options(export)
+    export.add_argument("--output", required=True)
+    export.add_argument("--replace", action="store_true")
+    export.add_argument("--no-metadata", action="store_true")
+    export.set_defaults(func=_snapshot_export)
+
+    inspect = commands.add_parser("inspect")
+    _add_common_options(inspect)
+    inspect.add_argument("--input", required=True)
+    inspect.set_defaults(func=_snapshot_inspect)
+
+    import_parser = commands.add_parser("import")
+    _add_common_options(import_parser)
+    import_parser.add_argument("--input", required=True)
+    import_parser.add_argument("--output", required=True)
+    import_parser.add_argument("--replace", action="store_true")
+    import_parser.set_defaults(func=_snapshot_import)
 
 
 def _add_adapter_parsers(subparsers: argparse._SubParsersAction) -> None:

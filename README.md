@@ -318,7 +318,43 @@ uv run fieldbook note add \
 uv run fieldbook note show "$NOTE_ID" --json
 ```
 
-Refresh from a file-based manifest:
+Refresh external state explicitly through snapshots:
+
+```bash
+mkdir -p .fieldbook
+cat > .fieldbook/refresh.toml <<'EOF'
+[sources.iris_jobs]
+kind = "command"
+adapter = "iris-jobs-json"
+command = ["python", "scripts/export_iris_jobs.py", "--experiment", "{experiment_id}"]
+description = "Export Iris job summaries for this experiment."
+
+[sources.metrics_csv]
+kind = "file"
+adapter = "metrics-csv"
+path = "artifacts/latest_metrics.csv"
+description = "Import a local metric CSV snapshot."
+EOF
+
+uv run fieldbook refresh list-sources --json
+uv run fieldbook refresh run --source iris_jobs --experiment "$EXP_ID" --json
+uv run fieldbook refresh run --source iris_jobs --experiment "$EXP_ID" --apply --json
+uv run fieldbook refresh log --json
+```
+
+Refresh writes raw snapshots and derived manifests under
+`.experiments/refresh-snapshots/<source>/`. Dry-run is the default and still
+records a refresh event; `--apply` mutates experiment rows only through
+reconcile. Use `--all` only when you intentionally want every configured
+runnable source. Doctor reports failed refresh events, missing/stale snapshots,
+unapplied dry-run manifests, and suspected secrets in refresh snapshots.
+Command sources support `{experiment_id}`, `{ledger_path}`, and `{source}`
+placeholders in argv entries.
+If the repo already uses `.fieldbook` as a ledger-config file, put the refresh
+TOML elsewhere and pass `--config <path>`.
+
+Use a file-based reconcile manifest directly when a repo-specific script already
+produced one:
 
 ```bash
 uv run fieldbook reconcile file \

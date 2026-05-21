@@ -20,7 +20,16 @@ from fieldbook.validation import (
 
 
 MANIFEST_VERSION = 1
-MANIFEST_SECTIONS = ["runs", "jobs", "artifacts", "metrics", "notes", "custom_attributes", "sync_events"]
+MANIFEST_SECTIONS = [
+    "runs",
+    "jobs",
+    "artifacts",
+    "metrics",
+    "notes",
+    "validations",
+    "custom_attributes",
+    "sync_events",
+]
 
 
 class AdapterHandler(Protocol):

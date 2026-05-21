@@ -29,6 +29,7 @@ from fieldbook.output import emit
 from fieldbook.doctor import doctor_failed, format_doctor_text, list_doctor_checks, run_doctor
 from fieldbook.repository import Repository, note_body_preview
 from fieldbook.reconcile import load_manifest, reconcile_log, reconcile_manifest
+from fieldbook.refresh import list_refresh_sources, refresh_log, run_refresh
 from fieldbook.snapshot import export_snapshot, import_snapshot, inspect_snapshot
 from fieldbook.sql_query import DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_SQL_LIMIT, DEFAULT_SQL_TIMEOUT, execute_readonly_sql, resolve_sql_text
 from fieldbook.validation import NOTE_BODY_FORMATS, parse_attrs, validate_metric_value
@@ -91,6 +92,8 @@ def _is_read_only(args: argparse.Namespace) -> bool:
         return getattr(args, "reconcile_command", None) == "log" or (
             getattr(args, "reconcile_command", None) == "file" and not getattr(args, "apply", False)
         )
+    if command == "refresh":
+        return getattr(args, "refresh_command", None) in {"list-sources", "log"}
     if command in {"db", "sql"}:
         return True
     if command == "session":
@@ -169,6 +172,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             stale_submitting_hours=args.stale_submitting_hours,
             stale_unknown_submit_hours=args.stale_unknown_submit_hours,
             retry_loop_threshold=args.retry_loop_threshold,
+            stale_refresh_snapshot_days=args.stale_refresh_snapshot_days,
             locality_recent_days=args.locality_recent_days,
             cwd=Path.cwd(),
             resolved_via=resolution.resolved_via,
@@ -788,6 +792,65 @@ def _reconcile_log(args: argparse.Namespace, repo: Repository) -> dict[str, Any]
     )
 
 
+def _refresh_list_sources(args: argparse.Namespace) -> int:
+    resolution = resolve_ledger_location(ledger=args.ledger)
+    ledger_path = resolution.path
+    if ledger_path is None:
+        raise NotFoundError("Fieldbook ledger not found; run `fieldbook init` first")
+    payload = list_refresh_sources(ledger_path=ledger_path, config_path=Path(args.config) if args.config else None)
+    emit(payload, json_output=args.json)
+    return ExitCode.SUCCESS
+
+
+def _refresh_run(args: argparse.Namespace) -> int:
+    if bool(args.source) == bool(args.all):
+        raise ValidationError("refresh run requires exactly one of --source or --all")
+    resolution = resolve_ledger_location(ledger=args.ledger)
+    ledger_path = resolution.path
+    if ledger_path is None:
+        raise NotFoundError("Fieldbook ledger not found; run `fieldbook init` first")
+    conn = connect(ledger_path)
+    try:
+        session_id, _, _ = _resolved_session_id(resolution)
+        repo = Repository(conn, current_session_id=session_id)
+        config_path = Path(args.config) if args.config else None
+        source_listing = list_refresh_sources(ledger_path=ledger_path, config_path=config_path)
+        source_names = [source["name"] for source in source_listing["sources"]] if args.all else [args.source]
+        payload = run_refresh(
+            repo,
+            ledger_path=ledger_path,
+            config_path=config_path,
+            source_names=source_names,
+            experiment_ref=args.experiment,
+            apply=args.apply,
+        )
+        if args.all and not payload.get("all"):
+            payload = {"all": True, "results": [payload], "failed": payload.get("status") == "failed"}
+    finally:
+        conn.close()
+    emit(payload, json_output=args.json, text=_format_refresh_result(payload))
+    failed = payload.get("failed") or payload.get("status") == "failed"
+    return ExitCode.VALIDATION_ERROR if failed else ExitCode.SUCCESS
+
+
+def _refresh_log(args: argparse.Namespace) -> int:
+    ledger_path = discover_ledger(ledger=args.ledger)
+    conn = connect(ledger_path, allow_newer_readonly=True)
+    try:
+        payload = refresh_log(
+            conn,
+            source=args.source,
+            status=args.status,
+            since=args.since,
+            before=args.before,
+            limit=args.limit,
+        )
+    finally:
+        conn.close()
+    emit(payload, json_output=args.json)
+    return ExitCode.SUCCESS
+
+
 def _export_metrics_long(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
     return repo.export_metrics_long(
         experiment_ref=args.experiment,
@@ -994,6 +1057,20 @@ def _format_validation_summary(summary: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _format_refresh_result(payload: dict[str, Any]) -> str:
+    if payload.get("all"):
+        lines = [f"Fieldbook refresh: {len(payload['results'])} source(s)"]
+        for result in payload["results"]:
+            lines.append(f"- {result['source']}: {result['status']} at {result['stage']}")
+        return "\n".join(lines)
+    return (
+        f"Fieldbook refresh {payload['source']}: {payload['status']} at {payload['stage']}\n"
+        f"snapshot: {payload.get('snapshot_path')}\n"
+        f"manifest: {payload.get('manifest_path')}\n"
+        f"next: {payload.get('suggested_next_action')}"
+    )
+
+
 def _format_note_list(notes: list[dict[str, Any]]) -> str:
     if not notes:
         return "(none)"
@@ -1090,6 +1167,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_note_parsers(subparsers)
     _add_session_parsers(subparsers)
     _add_reconcile_parsers(subparsers)
+    _add_refresh_parsers(subparsers)
     _add_writeback_parsers(subparsers)
     _add_export_parsers(subparsers)
     _add_adapter_parsers(subparsers)
@@ -1110,6 +1188,7 @@ def _add_doctor_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--stale-submitting-hours", type=float, default=1.0)
     parser.add_argument("--stale-unknown-submit-hours", type=float, default=6.0)
     parser.add_argument("--retry-loop-threshold", type=int, default=3)
+    parser.add_argument("--stale-refresh-snapshot-days", type=float, default=30.0)
     parser.add_argument("--locality-recent-days", type=float, default=7.0)
     parser.add_argument("--strict", action="store_true")
     parser.set_defaults(func=_cmd_doctor)
@@ -1481,6 +1560,35 @@ def _add_reconcile_parsers(subparsers: argparse._SubParsersAction) -> None:
     log_parser.add_argument("--limit", type=int, default=20)
     log_parser.add_argument("--operations", action="store_true")
     log_parser.set_defaults(func=_repo_command(_reconcile_log))
+
+
+def _add_refresh_parsers(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("refresh", help="Refresh external state through snapshots and reconcile")
+    commands = parser.add_subparsers(dest="refresh_command", required=True)
+
+    list_sources = commands.add_parser("list-sources")
+    _add_common_options(list_sources)
+    list_sources.add_argument("--config")
+    list_sources.set_defaults(func=_refresh_list_sources)
+
+    run = commands.add_parser("run")
+    _add_common_options(run)
+    selection = run.add_mutually_exclusive_group()
+    selection.add_argument("--source")
+    selection.add_argument("--all", action="store_true")
+    run.add_argument("--experiment")
+    run.add_argument("--config")
+    run.add_argument("--apply", action="store_true")
+    run.set_defaults(func=_refresh_run)
+
+    log = commands.add_parser("log")
+    _add_common_options(log)
+    log.add_argument("--source")
+    log.add_argument("--status")
+    log.add_argument("--since")
+    log.add_argument("--before")
+    log.add_argument("--limit", type=int, default=20)
+    log.set_defaults(func=_refresh_log)
 
 
 def _add_writeback_parsers(subparsers: argparse._SubParsersAction) -> None:

@@ -1,0 +1,11 @@
+[sources.iris_jobs]
+kind = "file"
+adapter = "iris-jobs-json"
+path = "iris_jobs_snapshot.json"
+description = "Fixture Iris job summary snapshot."
+
+[sources.metrics_csv]
+kind = "file"
+adapter = "metrics-csv"
+path = "metrics_snapshot.csv"
+description = "Fixture metric CSV snapshot."

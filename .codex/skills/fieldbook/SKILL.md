@@ -21,6 +21,11 @@ or export collaborator-ready data.
   --json` to confirm ledger locality and identity.
 - Use advisory sessions for agent context switching. They are provenance and
   handoff records, not locks.
+- Record live submissions before invoking external launchers. Use
+  `submitting` while the launcher is in-flight and `unknown_submit` if the
+  launcher exits without a reliable external acknowledgment.
+- Refresh external state explicitly with `fieldbook refresh`; do not wait until
+  after a successful launch to create the Fieldbook job record.
 
 ## Initialize A Ledger
 
@@ -75,6 +80,23 @@ uv run fieldbook run show "$RUN_ID" --json
 uv run fieldbook note list --entity-type experiment --entity-id "$EXP_ID" --status open --json
 uv run fieldbook note show "$NOTE_ID" --json
 ```
+
+If external job or metric state may have changed, refresh explicitly rather
+than relying on memory or chat logs:
+
+```bash
+uv run fieldbook refresh list-sources --json
+uv run fieldbook refresh run --source iris_jobs --experiment "$EXP_ID" --json
+uv run fieldbook refresh run --source iris_jobs --experiment "$EXP_ID" --apply --json
+uv run fieldbook refresh log --json
+```
+
+Refresh is snapshot-backed. The dry-run writes local diagnostics and a refresh
+event but does not mutate experiment rows. Apply only after inspecting the
+manifest or when the source is already trusted. If the repo already uses
+`.fieldbook` as a ledger-config file, pass `--config <path>` to point at the
+refresh TOML explicitly. Command-source argv entries may use `{experiment_id}`,
+`{ledger_path}`, and `{source}` placeholders.
 
 Use sessions when starting, leaving, or switching active research context:
 
@@ -147,6 +169,18 @@ uv run fieldbook job update-status "$JOB_ID" \
   --failure-reason "controller timeout before acknowledgment" \
   --json
 ```
+
+The launch protocol is:
+
+1. Run `fieldbook db where --json`.
+2. Start or switch a session for the active experiment.
+3. Add the job with `--status submitting` and the exact launcher command before
+   invoking the external launcher.
+4. Run the external launcher.
+5. Update the job to an acknowledged state with the external identifier, or to
+   `unknown_submit` / `failed` when the outcome is ambiguous or rejected.
+6. Later, run `fieldbook refresh run --source <name> --apply` to reconcile
+   external state and validations.
 
 When retrying a failed job, link lineage so recovered failures stop appearing as
 active blockers:

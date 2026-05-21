@@ -24,6 +24,7 @@ ATTR_TABLES = (
     "sync_events",
     "sessions",
     "validations",
+    "refresh_events",
 )
 ENTITY_TABLES = {
     "experiment": "experiments",
@@ -85,6 +86,7 @@ class DoctorOptions:
     stale_submitting_hours: float
     stale_unknown_submit_hours: float
     retry_loop_threshold: int
+    stale_refresh_snapshot_days: float
     locality_recent_days: float
     cwd: Path
     ledger_path: Path
@@ -105,6 +107,7 @@ def run_doctor(
     stale_submitting_hours: float = 1.0,
     stale_unknown_submit_hours: float = 6.0,
     retry_loop_threshold: int = 3,
+    stale_refresh_snapshot_days: float = 30.0,
     locality_recent_days: float = 7.0,
     resolved_via: str | None = None,
 ) -> dict[str, Any]:
@@ -136,6 +139,7 @@ def run_doctor(
             stale_submitting_hours=stale_submitting_hours,
             stale_unknown_submit_hours=stale_unknown_submit_hours,
             retry_loop_threshold=retry_loop_threshold,
+            stale_refresh_snapshot_days=stale_refresh_snapshot_days,
             locality_recent_days=locality_recent_days,
             cwd=cwd,
             ledger_path=ledger_path,
@@ -720,8 +724,111 @@ def _check_secret_patterns(conn: sqlite3.Connection, _options: DoctorOptions) ->
     return issues
 
 
+def _check_refresh_events(conn: sqlite3.Connection, options: DoctorOptions) -> list[DoctorIssue]:
+    issues: list[DoctorIssue] = []
+    cutoff = datetime.now(timezone.utc).timestamp() - options.stale_refresh_snapshot_days * 24 * 60 * 60
+    for row in conn.execute(
+        "SELECT * FROM v_refresh_log_v1 ORDER BY finished_at DESC, refresh_event_id DESC"
+    ).fetchall():
+        if row["status"] == "failed":
+            issues.append(
+                DoctorIssue(
+                    code="refresh.failed",
+                    severity="warning",
+                    entity_type="refresh_event",
+                    entity_id=row["refresh_event_id"],
+                    message="refresh event failed",
+                    details={"source": row["source"], "stage": row["stage"], "error_message": row["error_message"]},
+                    suggested_next_action="Inspect the refresh debug files and rerun the source after fixing the cause.",
+                )
+            )
+        for column in ("snapshot_path", "manifest_path", "debug_path"):
+            raw_path = row[column]
+            if not raw_path:
+                continue
+            path = Path(raw_path)
+            if not path.exists():
+                issues.append(
+                    DoctorIssue(
+                        code="refresh.snapshot_missing",
+                        severity="warning",
+                        entity_type="refresh_event",
+                        entity_id=row["refresh_event_id"],
+                        message="refresh event references a missing snapshot/debug file",
+                        details={"source": row["source"], "path": raw_path, "path_column": column},
+                        suggested_next_action="Re-run the refresh source or archive/move stale local diagnostics deliberately.",
+                    )
+                )
+                continue
+            try:
+                modified = path.stat().st_mtime
+            except OSError:
+                continue
+            if modified < cutoff:
+                issues.append(
+                    DoctorIssue(
+                        code="refresh.snapshot_stale",
+                        severity="warning",
+                        entity_type="refresh_event",
+                        entity_id=row["refresh_event_id"],
+                        message="refresh snapshot/debug file is older than the configured threshold",
+                        details={
+                            "source": row["source"],
+                            "path": raw_path,
+                            "path_column": column,
+                            "stale_refresh_snapshot_days": options.stale_refresh_snapshot_days,
+                        },
+                        suggested_next_action="Refresh the source again if this snapshot is still used for current decisions.",
+                    )
+                )
+            issues.extend(_secret_file_issues(path, row=row, path_column=column))
+        if row["status"] == "dry_run" and row["manifest_path"]:
+            issues.append(
+                DoctorIssue(
+                    code="refresh.manifest_unapplied",
+                    severity="warning",
+                    entity_type="refresh_event",
+                    entity_id=row["refresh_event_id"],
+                    message="refresh dry-run manifest has not been applied",
+                    details={"source": row["source"], "manifest_path": row["manifest_path"]},
+                    suggested_next_action="Inspect the manifest and rerun refresh with --apply if the plan is correct.",
+                )
+            )
+    return issues
+
+
+def _secret_file_issues(path: Path, *, row: sqlite3.Row, path_column: str) -> list[DoctorIssue]:
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return []
+    issues: list[DoctorIssue] = []
+    for family, pattern in SECRET_PATTERNS.items():
+        match = pattern.search(text)
+        if not match:
+            continue
+        issues.append(
+            DoctorIssue(
+                code="privacy.secret_pattern",
+                severity="warning",
+                entity_type="refresh_event",
+                entity_id=row["refresh_event_id"],
+                message="possible secret pattern found in refresh snapshot/debug file",
+                details={
+                    "source": row["source"],
+                    "path": str(path),
+                    "path_column": path_column,
+                    "pattern_family": family,
+                    "snippet": _redacted_snippet(match.group(0)),
+                },
+                suggested_next_action="Treat refresh snapshots as local sensitive diagnostics; remove or sanitize if sharing.",
+            )
+        )
+    return issues
+
+
 def _attrs_secret_query(table: str) -> str:
-    if table in {"reconcile_events", "sync_events", "sessions"}:
+    if table in {"reconcile_events", "sync_events", "sessions", "refresh_events"}:
         return f"SELECT id, attrs_json FROM {table} WHERE attrs_json IS NOT NULL"
     return f"SELECT id, attrs_json FROM {table} WHERE deleted_at IS NULL AND attrs_json IS NOT NULL"
 
@@ -922,5 +1029,12 @@ DOCTOR_CHECKS: dict[str, DoctorCheck] = {
         default_enabled=True,
         severity="warning",
         runner=_check_secret_patterns,
+    ),
+    "refresh": DoctorCheck(
+        id="refresh",
+        description="Detect failed refreshes, stale snapshots, and unapplied refresh manifests.",
+        default_enabled=True,
+        severity="warning",
+        runner=_check_refresh_events,
     ),
 }

@@ -1,0 +1,11 @@
+{
+  "jobs": [
+    {
+      "id": "job_fixture_refresh",
+      "name": "fixture refresh",
+      "status": "succeeded",
+      "external_id": "/fixture/iris/job",
+      "launcher": "iris"
+    }
+  ]
+}

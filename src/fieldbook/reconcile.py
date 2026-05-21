@@ -19,6 +19,7 @@ from fieldbook.validation import (
     NOTE_TYPES,
     RUN_STATUSES,
     SYNC_EVENT_STATUSES,
+    VALIDATION_STATUSES,
     attrs_json,
     load_attrs,
     require_choice,
@@ -31,7 +32,7 @@ from fieldbook.validation import (
 )
 
 
-ARCHIVABLE_ENTITIES = {"runs", "jobs", "artifacts", "metrics", "notes"}
+ARCHIVABLE_ENTITIES = {"runs", "jobs", "artifacts", "metrics", "notes", "validations"}
 UPSERT_ONLY_ENTITIES = {"custom_attributes"}
 ENTITY_ORDER = {
     "runs": 0,
@@ -39,8 +40,9 @@ ENTITY_ORDER = {
     "artifacts": 2,
     "metrics": 3,
     "notes": 4,
-    "custom_attributes": 5,
-    "sync_events": 6,
+    "validations": 5,
+    "custom_attributes": 6,
+    "sync_events": 7,
 }
 ACTION_ORDER = {"insert": 0, "update": 1, "sync_event": 2, "noop": 3, "archive": 4}
 NOTE_AUDIT_PREVIEW_CHARS = 200
@@ -56,6 +58,8 @@ ENTITY_KEYS = {
     "metrics": "metrics",
     "note": "notes",
     "notes": "notes",
+    "validation": "validations",
+    "validations": "validations",
     "custom_attribute": "custom_attributes",
     "custom_attributes": "custom_attributes",
     "sync_event": "sync_events",
@@ -171,7 +175,7 @@ def reconcile_log(
 
 
 def _manifest_keys() -> list[str]:
-    return ["runs", "jobs", "artifacts", "metrics", "notes", "custom_attributes", "sync_events"]
+    return ["runs", "jobs", "artifacts", "metrics", "notes", "validations", "custom_attributes", "sync_events"]
 
 
 def _as_list(value: Any, label: str) -> list[dict[str, Any]]:
@@ -223,6 +227,9 @@ def _plan(conn: sqlite3.Connection, manifest: dict[str, list[dict[str, Any]]], e
     for note in normalized_manifest.get("notes", []):
         operations.append(_plan_note(conn, note, order=order))
         order += 1
+    for validation in normalized_manifest.get("validations", []):
+        operations.append(_plan_validation(conn, validation, order=order))
+        order += 1
     for custom_attr in normalized_manifest.get("custom_attributes", []):
         operations.append(_plan_custom_attrs(conn, custom_attr, order=order))
         order += 1
@@ -237,6 +244,7 @@ def _plan(conn: sqlite3.Connection, manifest: dict[str, list[dict[str, Any]]], e
             operation["order"],
         ),
     )
+    _validate_retry_operations(conn, ordered)
     counts = _counts(ordered)
     return {"operations": ordered, "counts": counts}
 
@@ -390,6 +398,7 @@ def _plan_job(conn: sqlite3.Connection, row: dict[str, Any], experiment_id: str 
                 "launcher",
                 "external_system",
                 "external_id",
+                "retry_of",
                 "failure_reason",
                 "started_at",
                 "finished_at",
@@ -432,6 +441,64 @@ def _plan_artifact(conn: sqlite3.Connection, row: dict[str, Any], experiment_id:
             diff=diff,
         )
     return _operation(entity="artifacts", action="insert", entity_id=artifact_id, row=planned, order=order)
+
+
+def _plan_validation(conn: sqlite3.Connection, row: dict[str, Any], *, order: int) -> dict[str, Any]:
+    op = _row_op(row, entity="validations")
+    clean = _clean_row(row)
+    existing = _find_entity(conn, "validations", clean)
+    if op == "archive":
+        return _archive_operation("validations", clean, existing, order=order)
+    require_choice(clean["entity_type"], ENTITY_TYPES, "entity type")
+    require_choice(clean["status"], VALIDATION_STATUSES, "validation status")
+    if not clean.get("entity_id") or not clean.get("check_name"):
+        raise ValidationError("validation reconcile rows require entity_type, entity_id, check_name, and status")
+    if not _entity_exists(conn, clean["entity_type"], clean["entity_id"]):
+        raise ValidationError(f"validation entity does not exist: {clean['entity_type']}:{clean['entity_id']}")
+    details = clean.get("details", clean.get("details_json", {}))
+    if isinstance(details, str):
+        details = json.loads(details)
+    if not isinstance(details, dict):
+        raise ValidationError("validation details must decode to an object")
+    clean["details"] = details
+    if clean.get("source_artifact_id") and not _active_row_exists(conn, "artifacts", clean["source_artifact_id"]):
+        raise ValidationError(f"validation source_artifact_id does not exist: {clean['source_artifact_id']}")
+    if clean.get("source_job_id") and not _active_row_exists(conn, "jobs", clean["source_job_id"]):
+        raise ValidationError(f"validation source_job_id does not exist: {clean['source_job_id']}")
+    validation_id = existing["id"] if existing else clean.get("id", new_id("val"))
+    planned = {**clean, "id": validation_id}
+    if existing:
+        if "attrs" not in planned:
+            planned["attrs"] = load_attrs(existing["attrs_json"])
+        diff = _row_diff(
+            existing,
+            planned,
+            fields=[
+                "entity_type",
+                "entity_id",
+                "check_name",
+                "status",
+                "expected_value",
+                "measured_value",
+                "source_artifact_id",
+                "source_job_id",
+                "attrs",
+            ],
+        )
+        old_details = json.loads(existing["details_json"])
+        if old_details != details:
+            diff["details"] = [old_details, details]
+        action = "update" if diff else "noop"
+        return _operation(
+            entity="validations",
+            action=action,
+            entity_id=validation_id,
+            row=planned,
+            order=order,
+            existing=existing,
+            diff=diff,
+        )
+    return _operation(entity="validations", action="insert", entity_id=validation_id, row=planned, order=order)
 
 
 def _plan_metric(conn: sqlite3.Connection, row: dict[str, Any], *, order: int) -> dict[str, Any]:
@@ -583,7 +650,49 @@ def _find_entity(conn: sqlite3.Connection, table: str, row: dict[str, Any]) -> s
                     row.get("source_artifact_id"),
                 ),
             ).fetchone()
+    if table == "validations" and row.get("entity_type") and row.get("entity_id") and row.get("check_name"):
+        return conn.execute(
+            "SELECT * FROM validations WHERE entity_type = ? AND entity_id = ? AND check_name = ? AND deleted_at IS NULL",
+            (row["entity_type"], row["entity_id"], row["check_name"]),
+        ).fetchone()
     return None
+
+
+def _active_row_exists(conn: sqlite3.Connection, table: str, row_id: str) -> bool:
+    return bool(conn.execute(f"SELECT 1 FROM {table} WHERE id = ? AND deleted_at IS NULL", (row_id,)).fetchone())
+
+
+def _entity_exists(conn: sqlite3.Connection, entity_type: str, entity_id: str) -> bool:
+    table = _table_for_entity_type(entity_type)
+    return _active_row_exists(conn, table, entity_id)
+
+
+def _validate_retry_operations(conn: sqlite3.Connection, operations: list[dict[str, Any]]) -> None:
+    job_rows: dict[str, dict[str, Any]] = {}
+    for operation in operations:
+        if operation["entity"] == "jobs" and operation["action"] in {"insert", "update", "noop"}:
+            job_rows[operation["id"]] = operation["row"]
+    existing_rows = {
+        row["id"]: {"id": row["id"], "retry_of": row["retry_of"]}
+        for row in conn.execute("SELECT id, retry_of FROM jobs WHERE deleted_at IS NULL").fetchall()
+    }
+    graph = {job_id: row.get("retry_of") for job_id, row in existing_rows.items()}
+    graph.update({job_id: row.get("retry_of") for job_id, row in job_rows.items()})
+    active_job_ids = set(existing_rows) | set(job_rows)
+    for job_id, retry_of in graph.items():
+        if retry_of is None:
+            continue
+        if retry_of == job_id:
+            raise ValidationError("retry_of cannot reference the job itself")
+        if retry_of not in active_job_ids:
+            raise ValidationError(f"retry_of does not reference an existing active job: {retry_of}")
+        seen: set[str] = set()
+        current = job_id
+        while current in graph and graph[current] is not None:
+            if current in seen:
+                raise ValidationError("retry_of would create a retry cycle")
+            seen.add(current)
+            current = graph[current]
 
 
 def _validate_parent_run(conn: sqlite3.Connection, run_id: str, parent_run_id: str | None) -> None:
@@ -653,6 +762,8 @@ def _apply_plan(
             _apply_metric(conn, operation)
         elif entity == "notes":
             _apply_note(conn, operation, session_id=session_id)
+        elif entity == "validations":
+            _apply_validation(conn, operation, session_id=session_id)
         elif entity == "custom_attributes":
             _apply_custom_attrs(conn, operation)
         elif entity == "sync_events":
@@ -710,8 +821,8 @@ def _apply_job(conn: sqlite3.Connection, operation: dict[str, Any]) -> None:
     if operation["action"] == "insert":
         conn.execute(
             "INSERT INTO jobs (id, experiment_id, run_id, name, status, command, launcher, external_system, "
-            "external_id, failure_reason, created_at, updated_at, started_at, finished_at, attrs_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "external_id, retry_of, failure_reason, created_at, updated_at, started_at, finished_at, attrs_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 row["id"],
                 row.get("experiment_id"),
@@ -722,6 +833,7 @@ def _apply_job(conn: sqlite3.Connection, operation: dict[str, Any]) -> None:
                 row.get("launcher"),
                 row.get("external_system"),
                 row.get("external_id"),
+                row.get("retry_of"),
                 row.get("failure_reason"),
                 now,
                 now,
@@ -735,7 +847,8 @@ def _apply_job(conn: sqlite3.Connection, operation: dict[str, Any]) -> None:
             "UPDATE jobs SET experiment_id = COALESCE(?, experiment_id), run_id = COALESCE(?, run_id), "
             "name = COALESCE(?, name), status = COALESCE(?, status), command = COALESCE(?, command), "
             "launcher = COALESCE(?, launcher), external_system = COALESCE(?, external_system), "
-            "external_id = COALESCE(?, external_id), failure_reason = COALESCE(?, failure_reason), "
+            "external_id = COALESCE(?, external_id), retry_of = COALESCE(?, retry_of), "
+            "failure_reason = COALESCE(?, failure_reason), "
             "started_at = COALESCE(?, started_at), finished_at = COALESCE(?, finished_at), attrs_json = ?, "
             "updated_at = ? WHERE id = ?",
             (
@@ -747,6 +860,7 @@ def _apply_job(conn: sqlite3.Connection, operation: dict[str, Any]) -> None:
                 row.get("launcher"),
                 row.get("external_system"),
                 row.get("external_id"),
+                row.get("retry_of"),
                 row.get("failure_reason"),
                 row.get("started_at"),
                 row.get("finished_at"),
@@ -856,6 +970,52 @@ def _apply_note(conn: sqlite3.Connection, operation: dict[str, Any], *, session_
                 row.get("body"),
                 row.get("body_format"),
                 row.get("author"),
+                attrs_json(attrs),
+                now,
+                row["id"],
+            ),
+        )
+
+
+def _apply_validation(conn: sqlite3.Connection, operation: dict[str, Any], *, session_id: str | None) -> None:
+    row = operation["row"]
+    attrs = dict(row.get("attrs", {}))
+    now = utc_now()
+    if operation["action"] == "insert":
+        conn.execute(
+            "INSERT INTO validations (id, entity_type, entity_id, check_name, status, expected_value, measured_value, "
+            "details_json, source_artifact_id, source_job_id, session_id, created_at, updated_at, attrs_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                row["id"],
+                row["entity_type"],
+                row["entity_id"],
+                row["check_name"],
+                row["status"],
+                row.get("expected_value"),
+                row.get("measured_value"),
+                attrs_json(row.get("details", {})),
+                row.get("source_artifact_id"),
+                row.get("source_job_id"),
+                session_id,
+                now,
+                now,
+                attrs_json(attrs),
+            ),
+        )
+    elif operation["action"] == "update":
+        conn.execute(
+            "UPDATE validations SET status = ?, expected_value = ?, measured_value = ?, details_json = ?, "
+            "source_artifact_id = COALESCE(?, source_artifact_id), source_job_id = COALESCE(?, source_job_id), "
+            "session_id = COALESCE(?, session_id), attrs_json = ?, updated_at = ? WHERE id = ?",
+            (
+                row["status"],
+                row.get("expected_value"),
+                row.get("measured_value"),
+                attrs_json(row.get("details", {})),
+                row.get("source_artifact_id"),
+                row.get("source_job_id"),
+                session_id,
                 attrs_json(attrs),
                 now,
                 row["id"],

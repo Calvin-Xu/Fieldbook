@@ -18,11 +18,13 @@ from fieldbook.validation import (
     NOTE_BODY_FORMATS,
     NOTE_TYPES,
     RUN_STATUSES,
+    VALIDATION_STATUSES,
     attrs_json,
     file_sha256,
     load_attrs,
     normalize_tag,
     require_choice,
+    validate_attrs_dict,
     validate_content_hash,
     validate_idempotency_key,
     validate_metric_value,
@@ -132,16 +134,65 @@ class Repository:
             "ORDER BY updated_at DESC LIMIT 20",
             (experiment_id,),
         ).fetchall()
+        blocker_rows = self.conn.execute(
+            "SELECT * FROM v_jobs_with_recovery_v1 WHERE experiment_id = ? AND is_blocking_failed = 1 "
+            "ORDER BY updated_at DESC, job_id LIMIT 20",
+            (experiment_id,),
+        ).fetchall()
+        recovery_rows = self.conn.execute(
+            "SELECT * FROM v_jobs_with_recovery_v1 WHERE experiment_id = ? AND is_recovery_in_progress = 1 "
+            "ORDER BY updated_at DESC, job_id LIMIT 20",
+            (experiment_id,),
+        ).fetchall()
+        recovered_rows = self.conn.execute(
+            "SELECT * FROM v_jobs_with_recovery_v1 WHERE experiment_id = ? AND is_recovered_failed = 1 "
+            "ORDER BY updated_at DESC, job_id LIMIT 20",
+            (experiment_id,),
+        ).fetchall()
+        submitting_rows = self.conn.execute(
+            "SELECT * FROM jobs WHERE experiment_id = ? AND status = 'submitting' AND deleted_at IS NULL "
+            "ORDER BY updated_at DESC, id LIMIT 20",
+            (experiment_id,),
+        ).fetchall()
+        unknown_submit_rows = self.conn.execute(
+            "SELECT * FROM jobs WHERE experiment_id = ? AND status = 'unknown_submit' AND deleted_at IS NULL "
+            "ORDER BY updated_at DESC, id LIMIT 20",
+            (experiment_id,),
+        ).fetchall()
+        validation_rows = self.conn.execute(
+            "SELECT * FROM validations WHERE entity_type = 'experiment' AND entity_id = ? AND deleted_at IS NULL "
+            "ORDER BY updated_at DESC, id",
+            (experiment_id,),
+        ).fetchall()
+        validation_summary = self._validation_summary(validation_rows)
         artifact_rows = self._experiment_artifact_rows(experiment_id, limit=20)
+        active_job_count = sum(job_counts.get(status, 0) for status in ("submitting", "unknown_submit", "queued", "running"))
+        has_active_blockers = bool(blocker_rows or validation_summary["failed"] or validation_summary["unknown_blocking"])
         return {
             "experiment": experiment,
             "run_count": run_count,
             "job_counts": job_counts,
+            "ready": {
+                "is_ready": not has_active_blockers and active_job_count == 0,
+                "has_active_blockers": has_active_blockers,
+                "blocker_count": len(blocker_rows) + len(validation_summary["failed"]) + len(validation_summary["unknown_blocking"]),
+                "active_job_count": active_job_count,
+                "recovery_in_progress_count": len(recovery_rows),
+                "recovered_failed_count": len(recovered_rows),
+                "submission_uncertainty_count": len(submitting_rows) + len(unknown_submit_rows),
+                "validation_status": validation_summary["status"],
+            },
             "note_counts": self._experiment_note_counts(experiment_id),
             "notes": self._experiment_compact_notes(experiment_id),
             "stale_threshold_hours": stale_hours,
             "stale_jobs": [self._job_dict(row) for row in stale_rows],
             "failed_jobs": [self._job_dict(row) for row in failed_rows],
+            "blocking_failed_jobs": [self._job_dict(row) for row in blocker_rows],
+            "recovery_in_progress_failed_jobs": [self._job_dict(row) for row in recovery_rows],
+            "recovered_failed_jobs": [self._job_dict(row) for row in recovered_rows],
+            "submission_in_progress_jobs": [self._job_dict(row) for row in submitting_rows],
+            "submission_unknown_jobs": [self._job_dict(row) for row in unknown_submit_rows],
+            "validations": validation_summary,
             "key_artifacts": [self._artifact_dict(row) for row in artifact_rows],
         }
 
@@ -298,6 +349,7 @@ class Repository:
         failure_reason: str | None,
         started_at: str | None,
         finished_at: str | None,
+        retry_of_ref: str | None,
         attrs: dict[str, Any],
         update_existing: bool,
     ) -> dict[str, Any]:
@@ -320,10 +372,11 @@ class Repository:
         with self.conn:
             if existing:
                 job_id = existing["id"]
+                retry_of_id = self._retry_of_id(job_id=job_id, retry_of_ref=retry_of_ref)
                 self.conn.execute(
                     "UPDATE jobs SET experiment_id = ?, run_id = ?, name = ?, status = ?, command = ?, launcher = ?, "
                     "failure_reason = ?, code_commit = ?, code_dirty = ?, started_at = ?, finished_at = ?, "
-                    "updated_at = ?, attrs_json = ? WHERE id = ?",
+                    "retry_of = COALESCE(?, retry_of), updated_at = ?, attrs_json = ? WHERE id = ?",
                     (
                         experiment_id,
                         run_id,
@@ -336,6 +389,7 @@ class Repository:
                         code_dirty,
                         started_at,
                         finished_at,
+                        retry_of_id,
                         now,
                         attrs_json(attrs),
                         job_id,
@@ -343,10 +397,11 @@ class Repository:
                 )
             else:
                 job_id = new_id("job")
+                retry_of_id = self._retry_of_id(job_id=job_id, retry_of_ref=retry_of_ref)
                 self.conn.execute(
                     "INSERT INTO jobs (id, experiment_id, run_id, name, status, command, launcher, external_system, "
-                    "external_id, failure_reason, code_commit, code_dirty, created_at, updated_at, started_at, "
-                    "finished_at, attrs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "external_id, retry_of, failure_reason, code_commit, code_dirty, created_at, updated_at, started_at, "
+                    "finished_at, attrs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         job_id,
                         experiment_id,
@@ -357,6 +412,7 @@ class Repository:
                         launcher,
                         external_system,
                         external_id,
+                        retry_of_id,
                         failure_reason,
                         code_commit,
                         code_dirty,
@@ -369,6 +425,14 @@ class Repository:
                 )
         return self.get_job(job_id)
 
+    def link_job_retry(self, *, job_ref: str, retry_of_ref: str) -> dict[str, Any]:
+        job = self.get_job(job_ref)
+        retry_of_id = self._retry_of_id(job_id=job["id"], retry_of_ref=retry_of_ref)
+        now = utc_now()
+        with self.conn:
+            self.conn.execute("UPDATE jobs SET retry_of = ?, updated_at = ? WHERE id = ?", (retry_of_id, now, job["id"]))
+        return self.get_job(job["id"])
+
     def update_job_status(
         self,
         *,
@@ -377,6 +441,8 @@ class Repository:
         failure_reason: str | None,
         started_at: str | None,
         finished_at: str | None,
+        external_system: str | None = None,
+        external_id: str | None = None,
     ) -> dict[str, Any]:
         require_choice(status, JOB_STATUSES, "job status")
         validate_utc_z(started_at, "started_at")
@@ -386,9 +452,10 @@ class Repository:
         with self.conn:
             self.conn.execute(
                 "UPDATE jobs SET status = ?, failure_reason = COALESCE(?, failure_reason), "
-                "started_at = COALESCE(?, started_at), finished_at = COALESCE(?, finished_at), updated_at = ? "
+                "started_at = COALESCE(?, started_at), finished_at = COALESCE(?, finished_at), "
+                "external_system = COALESCE(?, external_system), external_id = COALESCE(?, external_id), updated_at = ? "
                 "WHERE id = ?",
-                (status, failure_reason, started_at, finished_at, now, job["id"]),
+                (status, failure_reason, started_at, finished_at, external_system, external_id, now, job["id"]),
             )
         return self.get_job(job["id"])
 
@@ -424,6 +491,118 @@ class Repository:
         with self.conn:
             self.conn.execute("UPDATE jobs SET deleted_at = COALESCE(deleted_at, ?), updated_at = ? WHERE id = ?", (now, now, job["id"]))
         return self.get_job(job["id"])
+
+    def add_validation(
+        self,
+        *,
+        entity_type: str,
+        entity_ref: str,
+        check_name: str,
+        status: str,
+        expected_value: str | None,
+        measured_value: str | None,
+        details: dict[str, Any],
+        source_artifact_ref: str | None,
+        source_job_ref: str | None,
+        attrs: dict[str, Any],
+    ) -> dict[str, Any]:
+        entity_id = self._active_entity_id(entity_type, entity_ref)
+        require_choice(status, VALIDATION_STATUSES, "validation status")
+        if not check_name.strip():
+            raise ValidationError("validation check_name must not be empty")
+        validate_attrs_dict(attrs)
+        if not isinstance(details, dict):
+            raise ValidationError("validation details must be a JSON object")
+        source_artifact_id = self.get_artifact(source_artifact_ref)["id"] if source_artifact_ref else None
+        source_job_id = self.get_job(source_job_ref)["id"] if source_job_ref else None
+        now = utc_now()
+        existing = self.conn.execute(
+            "SELECT * FROM validations WHERE entity_type = ? AND entity_id = ? AND check_name = ? AND deleted_at IS NULL",
+            (entity_type, entity_id, check_name),
+        ).fetchone()
+        with self.conn:
+            if existing:
+                validation_id = existing["id"]
+                self.conn.execute(
+                    "UPDATE validations SET status = ?, expected_value = ?, measured_value = ?, details_json = ?, "
+                    "source_artifact_id = COALESCE(?, source_artifact_id), source_job_id = COALESCE(?, source_job_id), "
+                    "session_id = COALESCE(?, session_id), updated_at = ?, attrs_json = ? WHERE id = ?",
+                    (
+                        status,
+                        expected_value,
+                        measured_value,
+                        attrs_json(details),
+                        source_artifact_id,
+                        source_job_id,
+                        self.current_session_id,
+                        now,
+                        attrs_json(attrs),
+                        validation_id,
+                    ),
+                )
+            else:
+                validation_id = new_id("val")
+                self.conn.execute(
+                    "INSERT INTO validations (id, entity_type, entity_id, check_name, status, expected_value, "
+                    "measured_value, details_json, source_artifact_id, source_job_id, session_id, created_at, "
+                    "updated_at, attrs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        validation_id,
+                        entity_type,
+                        entity_id,
+                        check_name,
+                        status,
+                        expected_value,
+                        measured_value,
+                        attrs_json(details),
+                        source_artifact_id,
+                        source_job_id,
+                        self.current_session_id,
+                        now,
+                        now,
+                        attrs_json(attrs),
+                    ),
+                )
+        return self.get_validation(validation_id)
+
+    def list_validations(
+        self,
+        *,
+        entity_type: str | None = None,
+        entity_ref: str | None = None,
+        status: str | None = None,
+        include_archived: bool = False,
+    ) -> list[dict[str, Any]]:
+        params: list[Any] = [1 if include_archived else 0]
+        query = "SELECT * FROM validations WHERE (? OR deleted_at IS NULL)"
+        if entity_type:
+            require_choice(entity_type, ENTITY_TYPES, "entity type")
+            query += " AND entity_type = ?"
+            params.append(entity_type)
+        if entity_ref:
+            if not entity_type:
+                raise ValidationError("--entity-id requires --entity-type")
+            query += " AND entity_id = ?"
+            params.append(self._resolve_entity_id(entity_type, entity_ref))
+        if status:
+            require_choice(status, VALIDATION_STATUSES, "validation status")
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY updated_at DESC, id"
+        return [self._validation_dict(row) for row in self.conn.execute(query, params).fetchall()]
+
+    def get_validation(self, ref: str) -> dict[str, Any]:
+        return self._validation_dict(self._resolve_row("validations", ref))
+
+    def archive_validation(self, ref: str) -> dict[str, Any]:
+        validation = self.get_validation(ref)
+        now = utc_now()
+        with self.conn:
+            self.conn.execute(
+                "UPDATE validations SET deleted_at = COALESCE(deleted_at, ?), updated_at = ? WHERE id = ?",
+                (now, now, validation["id"]),
+            )
+        return self.get_validation(validation["id"])
 
     def add_artifact(
         self,
@@ -1058,6 +1237,55 @@ class Repository:
             raise ValidationError(f"experiment is archived/deleted and cannot be mutated: {experiment['id']}")
         return experiment["id"]
 
+    def _active_entity_id(self, entity_type: str, ref: str) -> str:
+        require_choice(entity_type, ENTITY_TYPES, "entity type")
+        row = self._resolve_row(
+            {
+                "experiment": "experiments",
+                "run": "runs",
+                "job": "jobs",
+                "artifact": "artifacts",
+                "metric": "metrics",
+            }[entity_type],
+            ref,
+            name_column="name" if entity_type in {"experiment", "run", "job"} else None,
+        )
+        if "deleted_at" in row.keys() and row["deleted_at"] is not None:
+            raise ValidationError(f"{entity_type} is archived/deleted and cannot be validated: {ref}")
+        return str(row["id"])
+
+    def _retry_of_id(self, *, job_id: str, retry_of_ref: str | None) -> str | None:
+        if retry_of_ref is None:
+            return None
+        try:
+            retry_target = self.get_job(retry_of_ref)
+        except NotFoundError as exc:
+            raise ValidationError(f"retry_of does not reference an existing job: {retry_of_ref}") from exc
+        retry_of_id = retry_target["id"]
+        if retry_target["deleted_at"] is not None:
+            raise ValidationError(f"retry_of references an archived/deleted job: {retry_of_id}")
+        if retry_of_id == job_id:
+            raise ValidationError("retry_of cannot reference the job itself")
+        if self._retry_chain_contains(start_job_id=retry_of_id, needle_job_id=job_id):
+            raise ValidationError("retry_of would create a retry cycle")
+        return retry_of_id
+
+    def _retry_chain_contains(self, *, start_job_id: str, needle_job_id: str) -> bool:
+        current = start_job_id
+        seen: set[str] = set()
+        while current and current not in seen:
+            seen.add(current)
+            row = self.conn.execute(
+                "SELECT retry_of FROM jobs WHERE id = ? AND deleted_at IS NULL",
+                (current,),
+            ).fetchone()
+            if row is None or row["retry_of"] is None:
+                return False
+            current = str(row["retry_of"])
+            if current == needle_job_id:
+                return True
+        return False
+
     def _session_experiment_id(self, ref: str | None, *, force_archived: bool) -> str | None:
         if ref is None:
             return None
@@ -1311,6 +1539,32 @@ class Repository:
         name_column = "name" if entity_type in {"experiment", "run", "job"} else None
         return self._resolve_row(table, ref, name_column=name_column)["id"]
 
+    def _validation_summary(self, rows: list[sqlite3.Row]) -> dict[str, Any]:
+        validations = [self._validation_dict(row) for row in rows]
+        failed = [row for row in validations if row["status"] == "fail"]
+        unknown_blocking = [
+            row for row in validations if row["status"] == "unknown" and row["attrs"].get("validation.blocking") is True
+        ]
+        warnings = [row for row in validations if row["status"] == "warning"]
+        if failed:
+            status = "fail"
+        elif unknown_blocking:
+            status = "unknown"
+        elif warnings:
+            status = "warning"
+        elif validations:
+            status = "pass"
+        else:
+            status = "none"
+        return {
+            "status": status,
+            "total": len(validations),
+            "failed": failed,
+            "unknown_blocking": unknown_blocking,
+            "warnings": warnings,
+            "rows": validations[:20],
+        }
+
     def _resolve_row(self, table: str, ref: str, *, name_column: str | None = None) -> sqlite3.Row:
         row = self.conn.execute(f"SELECT * FROM {table} WHERE id = ?", (ref,)).fetchone()
         if row:
@@ -1346,8 +1600,11 @@ class Repository:
 
     def _job_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         data = dict(row)
+        if "id" not in data and "job_id" in data:
+            data["id"] = data["job_id"]
         data["attrs"] = load_attrs(data.pop("attrs_json", "{}"))
-        data["code_dirty"] = bool(data["code_dirty"])
+        if "code_dirty" in data:
+            data["code_dirty"] = bool(data["code_dirty"])
         return data
 
     def _artifact_dict(self, row: sqlite3.Row) -> dict[str, Any]:
@@ -1360,6 +1617,12 @@ class Repository:
 
     def _note_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         data = dict(row)
+        data["attrs"] = load_attrs(data.pop("attrs_json", "{}"))
+        return data
+
+    def _validation_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        data = dict(row)
+        data["details"] = load_attrs(data.pop("details_json", "{}"))
         data["attrs"] = load_attrs(data.pop("attrs_json", "{}"))
         return data
 

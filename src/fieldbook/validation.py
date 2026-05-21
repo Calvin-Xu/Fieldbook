@@ -8,13 +8,25 @@ from typing import Any
 from fieldbook.errors import ValidationError
 
 
-JOB_STATUSES = {"planned", "queued", "running", "succeeded", "failed", "killed", "skipped", "unknown"}
+JOB_STATUSES = {
+    "planned",
+    "submitting",
+    "unknown_submit",
+    "queued",
+    "running",
+    "succeeded",
+    "failed",
+    "killed",
+    "skipped",
+    "unknown",
+}
 EXPERIMENT_STATUSES = {"active", "archived"}
 RUN_STATUSES = {"active", "archived"}
 ARTIFACT_TYPES = {
     "checkpoint",
     "eval-result",
     "metric-table",
+    "validation-report",
     "plot",
     "report",
     "log",
@@ -27,6 +39,7 @@ NOTE_STATUSES = {"open", "resolved", "superseded"}
 NOTE_BODY_FORMATS = {"markdown", "plain"}
 SYNC_EVENT_STATUSES = {"pending", "synced", "failed", "skipped"}
 ENTITY_TYPES = {"experiment", "run", "job", "artifact", "metric"}
+VALIDATION_STATUSES = {"pass", "fail", "warning", "unknown"}
 MAX_NOTE_TITLE_CHARS = 120
 MAX_NOTE_BODY_BYTES = 64 * 1024
 

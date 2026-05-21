@@ -168,7 +168,41 @@ JOB_ID=$(uv run fieldbook job add \
   --external-id /user/example-train \
   --command "uv run train.py" \
   --json | python -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+```
 
+For live submissions, record the job before invoking the external launcher when
+possible. Use `submitting` for an in-flight submitter and `unknown_submit` when
+the submitter times out before a reliable external acknowledgment. Link retries
+to the failed job they recover:
+
+```bash
+SUBMIT_JOB_ID=$(uv run fieldbook job add \
+  --experiment "$EXP_ID" \
+  --name "eval submission" \
+  --status submitting \
+  --launcher iris \
+  --command "$LAUNCH_COMMAND" \
+  --json | python -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+uv run fieldbook job update-status "$SUBMIT_JOB_ID" \
+  --status unknown_submit \
+  --failure-reason "controller timeout before acknowledgment" \
+  --json
+
+uv run fieldbook job add \
+  --experiment "$EXP_ID" \
+  --name "eval retry" \
+  --status queued \
+  --retry-of "$SUBMIT_JOB_ID" \
+  --launcher iris \
+  --external-system iris \
+  --external-id "$RETRY_JOB_PATH" \
+  --json
+```
+
+Record artifacts, metrics, structured validations, and notes:
+
+```bash
 uv run fieldbook artifact add \
   --run "$RUN_ID" \
   --type checkpoint \
@@ -181,6 +215,22 @@ uv run fieldbook metric add \
   --value 0.91 \
   --step 100 \
   --source-job "$JOB_ID" \
+  --json
+
+REPORT_ID=$(uv run fieldbook artifact add \
+  --experiment "$EXP_ID" \
+  --type validation-report \
+  --uri reports/coverage.md \
+  --json | python -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+uv run fieldbook validation add \
+  --entity-type experiment \
+  --entity-id "$EXP_ID" \
+  --check-name matrix.coverage.rollup \
+  --status pass \
+  --expected-value "262 rows" \
+  --measured-value "262 rows" \
+  --source-artifact "$REPORT_ID" \
   --json
 
 uv run fieldbook note add \
@@ -201,7 +251,7 @@ uv run fieldbook experiment triage "$EXP_ID" --json
 ```
 
 `status` is the compact navigation surface for agents: counts, failed/stale
-jobs, key artifacts, and note previews. `context` is the LLM-ready Markdown
+jobs, retry/recovery readiness, validation summaries, key artifacts, and note previews. `context` is the LLM-ready Markdown
 handoff surface with full bodies for active handoff, next-action, and debug
 notes plus recent research and decision notes.
 

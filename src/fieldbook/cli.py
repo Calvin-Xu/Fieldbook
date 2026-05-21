@@ -83,6 +83,8 @@ def _is_read_only(args: argparse.Namespace) -> bool:
         return getattr(args, "artifact_command", None) in {"list", "show"}
     if command == "metric":
         return getattr(args, "metric_command", None) == "list"
+    if command == "validation":
+        return getattr(args, "validation_command", None) in {"list", "show"}
     if command == "note":
         return getattr(args, "note_command", None) in {"list", "show"}
     if command == "reconcile":
@@ -164,6 +166,9 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             check_ids=args.check,
             stale_hours=args.stale_hours,
             stale_session_hours=args.stale_session_hours,
+            stale_submitting_hours=args.stale_submitting_hours,
+            stale_unknown_submit_hours=args.stale_unknown_submit_hours,
+            retry_loop_threshold=args.retry_loop_threshold,
             locality_recent_days=args.locality_recent_days,
             cwd=Path.cwd(),
             resolved_via=resolution.resolved_via,
@@ -507,6 +512,7 @@ def _job_add(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
         failure_reason=args.failure_reason,
         started_at=args.started_at,
         finished_at=args.finished_at,
+        retry_of_ref=args.retry_of,
         attrs=parse_attrs(args.attr),
         update_existing=args.update_existing,
     )
@@ -519,6 +525,8 @@ def _job_update_status(args: argparse.Namespace, repo: Repository) -> dict[str, 
         failure_reason=args.failure_reason,
         started_at=args.started_at,
         finished_at=args.finished_at,
+        external_system=args.external_system,
+        external_id=args.external_id,
     )
 
 
@@ -538,6 +546,10 @@ def _job_show(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
 
 def _job_archive(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
     return repo.archive_job(args.job)
+
+
+def _job_link_retry(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.link_job_retry(job_ref=args.job, retry_of_ref=args.retry_of)
 
 
 def _artifact_add(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
@@ -570,6 +582,38 @@ def _artifact_show(args: argparse.Namespace, repo: Repository) -> dict[str, Any]
 
 def _artifact_archive(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
     return repo.archive_artifact(args.artifact)
+
+
+def _validation_add(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.add_validation(
+        entity_type=args.entity_type,
+        entity_ref=args.entity_id,
+        check_name=args.check_name,
+        status=args.status,
+        expected_value=args.expected_value,
+        measured_value=args.measured_value,
+        details=_parse_json_object(args.details_json, "--details-json"),
+        source_artifact_ref=args.source_artifact,
+        source_job_ref=args.source_job,
+        attrs=parse_attrs(args.attr),
+    )
+
+
+def _validation_list(args: argparse.Namespace, repo: Repository) -> list[dict[str, Any]]:
+    return repo.list_validations(
+        entity_type=args.entity_type,
+        entity_ref=args.entity_id,
+        status=args.status,
+        include_archived=args.include_archived,
+    )
+
+
+def _validation_show(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.get_validation(args.validation)
+
+
+def _validation_archive(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.archive_validation(args.validation)
 
 
 def _metric_add(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
@@ -804,6 +848,7 @@ def _compact_job(row: dict[str, Any]) -> dict[str, Any]:
         "status": row["status"],
         "experiment_id": row["experiment_id"],
         "run_id": row["run_id"],
+        "retry_of": row.get("retry_of"),
         "updated_at": row["updated_at"],
         "external_id": row["external_id"],
     }
@@ -832,6 +877,18 @@ def _compact_note(row: dict[str, Any]) -> dict[str, Any]:
         "body_preview": note_body_preview(row["body"]),
         "updated_at": row["updated_at"],
     }
+
+
+def _parse_json_object(value: str | None, label: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValidationError(f"{label} must be valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValidationError(f"{label} must decode to an object")
+    return parsed
 
 
 def _resolve_note_body(args: argparse.Namespace) -> str:
@@ -868,12 +925,30 @@ def _format_experiment_context_markdown(context: dict[str, Any]) -> str:
         f"- Status: `{experiment['status']}`",
         f"- Runs: `{context['run_count']}`",
         f"- Jobs: `{context['job_counts']}`",
+        f"- Ready: `{context['ready']['is_ready']}`",
+        f"- Active blockers: `{context['ready']['blocker_count']}`",
+        f"- Active jobs: `{context['ready']['active_job_count']}`",
+        f"- Submission uncertainty: `{context['ready']['submission_uncertainty_count']}`",
         "",
         "## Jobs",
+        "",
+        _format_job_list("Blocking failed jobs", context["blocking_failed_jobs"]),
+        "",
+        _format_job_list("Submission in progress", context["submission_in_progress_jobs"]),
+        "",
+        _format_job_list("Unknown submissions", context["submission_unknown_jobs"]),
+        "",
+        _format_job_list("Recovery in progress", context["recovery_in_progress_failed_jobs"]),
+        "",
+        _format_job_list("Recovered failures", context["recovered_failed_jobs"]),
         "",
         _format_job_list("Stale jobs", context["stale_jobs"]),
         "",
         _format_job_list("Failed jobs", context["failed_jobs"]),
+        "",
+        "## Validations",
+        "",
+        _format_validation_summary(context["validations"]),
         "",
         "## Key Artifacts",
         "",
@@ -905,6 +980,18 @@ def _format_artifact_list(artifacts: list[dict[str, Any]]) -> str:
     if not artifacts:
         return "(none)"
     return "\n".join(f"- `{artifact['id']}` {artifact['type']}: {artifact['uri']}" for artifact in artifacts)
+
+
+def _format_validation_summary(summary: dict[str, Any]) -> str:
+    if not summary["rows"]:
+        return "(none)"
+    lines = [f"- Status: `{summary['status']}`", f"- Total: `{summary['total']}`"]
+    for validation in summary["rows"][:10]:
+        lines.append(
+            f"- `{validation['id']}` {validation['check_name']} status=`{validation['status']}` "
+            f"measured=`{validation.get('measured_value') or ''}`"
+        )
+    return "\n".join(lines)
 
 
 def _format_note_list(notes: list[dict[str, Any]]) -> str:
@@ -999,6 +1086,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_job_parsers(subparsers)
     _add_artifact_parsers(subparsers)
     _add_metric_parsers(subparsers)
+    _add_validation_parsers(subparsers)
     _add_note_parsers(subparsers)
     _add_session_parsers(subparsers)
     _add_reconcile_parsers(subparsers)
@@ -1019,6 +1107,9 @@ def _add_doctor_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--list-checks", action="store_true")
     parser.add_argument("--stale-hours", type=float, default=24.0)
     parser.add_argument("--stale-session-hours", type=float, default=24.0)
+    parser.add_argument("--stale-submitting-hours", type=float, default=1.0)
+    parser.add_argument("--stale-unknown-submit-hours", type=float, default=6.0)
+    parser.add_argument("--retry-loop-threshold", type=int, default=3)
     parser.add_argument("--locality-recent-days", type=float, default=7.0)
     parser.add_argument("--strict", action="store_true")
     parser.set_defaults(func=_cmd_doctor)
@@ -1178,6 +1269,7 @@ def _add_job_parsers(subparsers: argparse._SubParsersAction) -> None:
     add.add_argument("--failure-reason")
     add.add_argument("--started-at")
     add.add_argument("--finished-at")
+    add.add_argument("--retry-of")
     _add_external_options(add)
     _add_attr_option(add)
     add.set_defaults(func=_repo_command(_job_add))
@@ -1189,6 +1281,7 @@ def _add_job_parsers(subparsers: argparse._SubParsersAction) -> None:
     update.add_argument("--failure-reason")
     update.add_argument("--started-at")
     update.add_argument("--finished-at")
+    _add_external_options(update)
     update.set_defaults(func=_repo_command(_job_update_status))
 
     list_parser = commands.add_parser("list")
@@ -1208,6 +1301,12 @@ def _add_job_parsers(subparsers: argparse._SubParsersAction) -> None:
     _common_repo_parser(archive)
     archive.add_argument("job")
     archive.set_defaults(func=_repo_command(_job_archive))
+
+    link_retry = commands.add_parser("link-retry")
+    _common_repo_parser(link_retry)
+    link_retry.add_argument("job")
+    link_retry.add_argument("--retry-of", required=True)
+    link_retry.set_defaults(func=_repo_command(_job_link_retry))
 
 
 def _add_artifact_parsers(subparsers: argparse._SubParsersAction) -> None:
@@ -1244,6 +1343,43 @@ def _add_artifact_parsers(subparsers: argparse._SubParsersAction) -> None:
     _common_repo_parser(archive)
     archive.add_argument("artifact")
     archive.set_defaults(func=_repo_command(_artifact_archive))
+
+
+def _add_validation_parsers(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("validation", help="Manage structured validation checks")
+    commands = parser.add_subparsers(dest="validation_command", required=True)
+
+    add = commands.add_parser("add")
+    _common_repo_parser(add)
+    add.add_argument("--entity-type", required=True)
+    add.add_argument("--entity-id", required=True)
+    add.add_argument("--check-name", required=True)
+    add.add_argument("--status", required=True)
+    add.add_argument("--expected-value")
+    add.add_argument("--measured-value")
+    add.add_argument("--details-json")
+    add.add_argument("--source-artifact")
+    add.add_argument("--source-job")
+    _add_attr_option(add)
+    add.set_defaults(func=_repo_command(_validation_add))
+
+    list_parser = commands.add_parser("list")
+    _common_repo_parser(list_parser)
+    list_parser.add_argument("--entity-type")
+    list_parser.add_argument("--entity-id")
+    list_parser.add_argument("--status")
+    _add_include_verbose(list_parser)
+    list_parser.set_defaults(func=_repo_command(_validation_list))
+
+    show = commands.add_parser("show")
+    _common_repo_parser(show)
+    show.add_argument("validation")
+    show.set_defaults(func=_repo_command(_validation_show))
+
+    archive = commands.add_parser("archive")
+    _common_repo_parser(archive)
+    archive.add_argument("validation")
+    archive.set_defaults(func=_repo_command(_validation_archive))
 
 
 def _add_metric_parsers(subparsers: argparse._SubParsersAction) -> None:

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -13,13 +14,28 @@ from fieldbook.time_utils import utc_now
 
 
 STALE_JOB_STATUSES = ("queued", "running")
-ATTR_TABLES = ("experiments", "runs", "jobs", "artifacts", "notes", "reconcile_events", "sync_events", "sessions")
+ATTR_TABLES = (
+    "experiments",
+    "runs",
+    "jobs",
+    "artifacts",
+    "notes",
+    "reconcile_events",
+    "sync_events",
+    "sessions",
+    "validations",
+)
 ENTITY_TABLES = {
     "experiment": "experiments",
     "run": "runs",
     "job": "jobs",
     "artifact": "artifacts",
     "metric": "metrics",
+}
+SECRET_PATTERNS = {
+    "api_key_assignment": re.compile(r"(?:API_KEY|TOKEN|SECRET|PASSWORD)=[^\s'\"]{8,}"),
+    "openai_style_key": re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
+    "aws_access_key": re.compile(r"AKIA[0-9A-Z]{16}"),
 }
 
 
@@ -66,6 +82,9 @@ class DoctorCheck:
 class DoctorOptions:
     stale_hours: float
     stale_session_hours: float
+    stale_submitting_hours: float
+    stale_unknown_submit_hours: float
+    retry_loop_threshold: int
     locality_recent_days: float
     cwd: Path
     ledger_path: Path
@@ -83,6 +102,9 @@ def run_doctor(
     stale_hours: float,
     cwd: Path,
     stale_session_hours: float = 24.0,
+    stale_submitting_hours: float = 1.0,
+    stale_unknown_submit_hours: float = 6.0,
+    retry_loop_threshold: int = 3,
     locality_recent_days: float = 7.0,
     resolved_via: str | None = None,
 ) -> dict[str, Any]:
@@ -111,6 +133,9 @@ def run_doctor(
         options = DoctorOptions(
             stale_hours=stale_hours,
             stale_session_hours=stale_session_hours,
+            stale_submitting_hours=stale_submitting_hours,
+            stale_unknown_submit_hours=stale_unknown_submit_hours,
+            retry_loop_threshold=retry_loop_threshold,
             locality_recent_days=locality_recent_days,
             cwd=cwd,
             ledger_path=ledger_path,
@@ -492,6 +517,272 @@ def _check_stale_sessions(conn: sqlite3.Connection, options: DoctorOptions) -> l
     ]
 
 
+def _check_job_recovery(conn: sqlite3.Connection, options: DoctorOptions) -> list[DoctorIssue]:
+    issues: list[DoctorIssue] = []
+    cutoff_submitting = (
+        datetime.now(timezone.utc).replace(microsecond=0) - timedelta(hours=options.stale_submitting_hours)
+    ).isoformat().replace("+00:00", "Z")
+    cutoff_unknown = (
+        datetime.now(timezone.utc).replace(microsecond=0) - timedelta(hours=options.stale_unknown_submit_hours)
+    ).isoformat().replace("+00:00", "Z")
+    for row in conn.execute(
+        "SELECT id, name, status, updated_at FROM jobs WHERE deleted_at IS NULL AND status = 'submitting' "
+        "AND updated_at < ? ORDER BY updated_at, id",
+        (cutoff_submitting,),
+    ).fetchall():
+        issues.append(
+            DoctorIssue(
+                code="job_submission.submitting_stale",
+                severity="warning",
+                entity_type="job",
+                entity_id=row["id"],
+                message="job submission has not been acknowledged recently",
+                details={"status": row["status"], "updated_at": row["updated_at"]},
+                suggested_next_action="Refresh external job state or correct the job status.",
+            )
+        )
+    for row in conn.execute(
+        "SELECT id, name, status, updated_at FROM jobs WHERE deleted_at IS NULL AND status = 'unknown_submit' "
+        "AND updated_at < ? ORDER BY updated_at, id",
+        (cutoff_unknown,),
+    ).fetchall():
+        issues.append(
+            DoctorIssue(
+                code="job_submission.unknown_stale",
+                severity="warning",
+                entity_type="job",
+                entity_id=row["id"],
+                message="ambiguous job submission has not been resolved recently",
+                details={"status": row["status"], "updated_at": row["updated_at"]},
+                suggested_next_action="Refresh external job state, mark failed, or resubmit with retry lineage.",
+            )
+        )
+    for row in conn.execute(
+        "SELECT id, retry_of FROM jobs WHERE deleted_at IS NULL AND retry_of IS NOT NULL ORDER BY updated_at, id"
+    ).fetchall():
+        target = conn.execute("SELECT id FROM jobs WHERE id = ? AND deleted_at IS NULL", (row["retry_of"],)).fetchone()
+        if target is None:
+            issues.append(
+                DoctorIssue(
+                    code="job_retry.missing_target",
+                    severity="error",
+                    entity_type="job",
+                    entity_id=row["id"],
+                    message="retry job references a missing or archived target",
+                    details={"retry_of": row["retry_of"]},
+                    suggested_next_action="Repair retry lineage through a controlled update.",
+                )
+            )
+    for job_id, path in _retry_cycles(conn):
+        issues.append(
+            DoctorIssue(
+                code="job_retry.cycle",
+                severity="error",
+                entity_type="job",
+                entity_id=job_id,
+                message="job retry lineage contains a cycle",
+                details={"path": path},
+                suggested_next_action="Break the retry cycle through a controlled update.",
+            )
+        )
+    for row in _retry_loops(conn, threshold=options.retry_loop_threshold):
+        issues.append(
+            DoctorIssue(
+                code="job_retry.loop",
+                severity="warning",
+                entity_type="job",
+                entity_id=row["root_id"],
+                message="job retry chain exceeds the configured loop threshold without a successful descendant",
+                details=row,
+                suggested_next_action="Inspect the retry chain before launching another retry.",
+            )
+        )
+    stale_cutoff = (
+        datetime.now(timezone.utc).replace(microsecond=0) - timedelta(hours=options.stale_hours)
+    ).isoformat().replace("+00:00", "Z")
+    for row in conn.execute(
+        "SELECT r.job_id AS failed_job_id, r.active_descendant_id, child.status, child.updated_at "
+        "FROM v_jobs_with_recovery_v1 r "
+        "JOIN jobs child ON child.id = r.active_descendant_id "
+        "WHERE r.retry_state = 'recovery_in_progress' AND child.updated_at < ? "
+        "ORDER BY child.updated_at, r.job_id",
+        (stale_cutoff,),
+    ).fetchall():
+        issues.append(
+            DoctorIssue(
+                code="job_retry.recovery_stale",
+                severity="warning",
+                entity_type="job",
+                entity_id=row["failed_job_id"],
+                message="retry recovery is still in progress and has not updated recently",
+                details=dict(row),
+                suggested_next_action="Refresh external state for the retry or mark the recovery failed.",
+            )
+        )
+    for row in conn.execute(
+        "SELECT r.job_id, r.experiment_id, r.success_descendant_id FROM v_jobs_with_recovery_v1 r "
+        "WHERE r.retry_state = 'recovered_failed' AND EXISTS ("
+        "SELECT 1 FROM notes n WHERE n.deleted_at IS NULL AND n.note_type = 'debug' AND n.status = 'open' "
+        "AND ((n.entity_type = 'job' AND n.entity_id = r.job_id) "
+        "OR (n.entity_type = 'experiment' AND n.entity_id = r.experiment_id))"
+        ") ORDER BY r.job_id"
+    ).fetchall():
+        issues.append(
+            DoctorIssue(
+                code="job_retry.recovered_debug_open",
+                severity="warning",
+                entity_type="job",
+                entity_id=row["job_id"],
+                message="recovered failed job still has an open debug note",
+                details=dict(row),
+                suggested_next_action="Resolve or supersede the debug note if the recovery is complete.",
+            )
+        )
+    return issues
+
+
+def _check_validations(conn: sqlite3.Connection, _options: DoctorOptions) -> list[DoctorIssue]:
+    issues: list[DoctorIssue] = []
+    for row in conn.execute(
+        "SELECT id, entity_type, entity_id, check_name, status FROM validations "
+        "WHERE deleted_at IS NULL AND status = 'fail' ORDER BY updated_at, id"
+    ).fetchall():
+        issues.append(
+            DoctorIssue(
+                code="validation.failed",
+                severity="warning",
+                entity_type="validation",
+                entity_id=row["id"],
+                message="active validation is failing",
+                details=dict(row),
+                suggested_next_action="Inspect validation evidence and rerun or fix the underlying experiment step.",
+            )
+        )
+    for row in conn.execute(
+        "SELECT id, entity_type, entity_id, check_name, status FROM validations "
+        "WHERE deleted_at IS NULL AND status = 'unknown' AND INSTR(attrs_json, '\"validation.blocking\":true') > 0 "
+        "ORDER BY updated_at, id"
+    ).fetchall():
+        issues.append(
+            DoctorIssue(
+                code="validation.unknown_blocking",
+                severity="warning",
+                entity_type="validation",
+                entity_id=row["id"],
+                message="active validation has unknown blocking status",
+                details=dict(row),
+                suggested_next_action="Refresh or recompute the validation check.",
+            )
+        )
+    return issues
+
+
+def _check_secret_patterns(conn: sqlite3.Connection, _options: DoctorOptions) -> list[DoctorIssue]:
+    issues: list[DoctorIssue] = []
+    scans = [
+        ("job", "jobs", "id", "command", "SELECT id, command FROM jobs WHERE deleted_at IS NULL AND command IS NOT NULL"),
+        (
+            "note",
+            "notes",
+            "id",
+            "body",
+            "SELECT id, body FROM notes WHERE deleted_at IS NULL AND body IS NOT NULL",
+        ),
+    ]
+    scans.extend(
+        (
+            _entity_type_for_table(table),
+            table,
+            "id",
+            "attrs_json",
+            _attrs_secret_query(table),
+        )
+        for table in ATTR_TABLES
+    )
+    for entity_type, _table, id_column, field, query in scans:
+        for row in conn.execute(query).fetchall():
+            text = row[field] or ""
+            for family, pattern in SECRET_PATTERNS.items():
+                match = pattern.search(text)
+                if not match:
+                    continue
+                issues.append(
+                    DoctorIssue(
+                        code="privacy.secret_pattern",
+                        severity="warning",
+                        entity_type=entity_type,
+                        entity_id=row[id_column],
+                        message="possible secret pattern found in ledger text",
+                        details={"field": field, "pattern_family": family, "snippet": _redacted_snippet(match.group(0))},
+                        suggested_next_action="Move secrets out of Fieldbook text and rotate the secret if it was exposed.",
+                    )
+                )
+    return issues
+
+
+def _attrs_secret_query(table: str) -> str:
+    if table in {"reconcile_events", "sync_events", "sessions"}:
+        return f"SELECT id, attrs_json FROM {table} WHERE attrs_json IS NOT NULL"
+    return f"SELECT id, attrs_json FROM {table} WHERE deleted_at IS NULL AND attrs_json IS NOT NULL"
+
+
+def _retry_cycles(conn: sqlite3.Connection) -> list[tuple[str, list[str]]]:
+    rows = conn.execute("SELECT id, retry_of FROM jobs WHERE deleted_at IS NULL").fetchall()
+    graph = {row["id"]: row["retry_of"] for row in rows if row["retry_of"] is not None}
+    cycles: list[tuple[str, list[str]]] = []
+    reported: set[str] = set()
+    for start in graph:
+        seen: list[str] = []
+        current = start
+        while current in graph:
+            if current in seen:
+                cycle = seen[seen.index(current) :] + [current]
+                key = ",".join(sorted(set(cycle)))
+                if key not in reported:
+                    reported.add(key)
+                    cycles.append((start, cycle))
+                break
+            seen.append(current)
+            current = graph[current]
+    return cycles
+
+
+def _retry_loops(conn: sqlite3.Connection, *, threshold: int) -> list[dict[str, Any]]:
+    rows = conn.execute("SELECT id, retry_of, status FROM jobs WHERE deleted_at IS NULL").fetchall()
+    children: dict[str, list[sqlite3.Row]] = {}
+    status_by_id: dict[str, str] = {}
+    for row in rows:
+        status_by_id[row["id"]] = row["status"]
+        if row["retry_of"] is not None:
+            children.setdefault(row["retry_of"], []).append(row)
+    loops: list[dict[str, Any]] = []
+    for root_id, root_status in status_by_id.items():
+        if root_status != "failed":
+            continue
+        stack: list[tuple[str, int, list[str]]] = [(root_id, 0, [root_id])]
+        max_depth = 0
+        has_success = False
+        while stack:
+            node_id, depth, path = stack.pop()
+            max_depth = max(max_depth, depth)
+            for child in children.get(node_id, []):
+                child_path = [*path, child["id"]]
+                if child["status"] == "succeeded":
+                    has_success = True
+                if child["id"] in path:
+                    continue
+                stack.append((child["id"], depth + 1, child_path))
+        if max_depth > threshold and not has_success:
+            loops.append({"root_id": root_id, "max_retry_depth": max_depth, "retry_loop_threshold": threshold})
+    return loops
+
+
+def _redacted_snippet(value: str) -> str:
+    if len(value) <= 8:
+        return "<redacted>"
+    return f"{value[:4]}...{value[-4:]}"
+
+
 def _check_ledger_locality(_conn: sqlite3.Connection, options: DoctorOptions) -> list[DoctorIssue]:
     if options.resolved_via in {"--ledger", "FIELDBOOK_LEDGER", ".fieldbook"}:
         return []
@@ -610,5 +901,26 @@ DOCTOR_CHECKS: dict[str, DoctorCheck] = {
         default_enabled=True,
         severity="warning",
         runner=_check_ledger_locality,
+    ),
+    "job-recovery": DoctorCheck(
+        id="job-recovery",
+        description="Detect retry lineage and submission lifecycle issues.",
+        default_enabled=True,
+        severity="warning",
+        runner=_check_job_recovery,
+    ),
+    "validations": DoctorCheck(
+        id="validations",
+        description="Detect failed structured validations.",
+        default_enabled=True,
+        severity="warning",
+        runner=_check_validations,
+    ),
+    "privacy": DoctorCheck(
+        id="privacy",
+        description="Detect suspected secrets in ledger text fields.",
+        default_enabled=True,
+        severity="warning",
+        runner=_check_secret_patterns,
     ),
 }

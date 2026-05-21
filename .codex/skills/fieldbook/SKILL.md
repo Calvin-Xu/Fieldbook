@@ -128,10 +128,67 @@ uv run fieldbook run add --experiment "$EXP_ID" --name "$DERIVED_RUN" --parent-r
 uv run fieldbook job add --run "$RUN_ID" --status running --launcher iris --external-system iris --external-id "$JOB_PATH" --json
 ```
 
+Record jobs before launching when possible. Use `submitting` while the external
+launcher is in-flight, `unknown_submit` when the submitter times out before a
+reliable external acknowledgment, and `failed` only when the external system
+explicitly rejected the submission:
+
+```bash
+JOB_ID=$(uv run fieldbook job add \
+  --experiment "$EXP_ID" \
+  --name "eval submission" \
+  --status submitting \
+  --launcher iris \
+  --command "$LAUNCH_COMMAND" \
+  --json | jq -r .id)
+
+uv run fieldbook job update-status "$JOB_ID" \
+  --status unknown_submit \
+  --failure-reason "controller timeout before acknowledgment" \
+  --json
+```
+
+When retrying a failed job, link lineage so recovered failures stop appearing as
+active blockers:
+
+```bash
+uv run fieldbook job add \
+  --experiment "$EXP_ID" \
+  --name "eval retry" \
+  --status queued \
+  --retry-of "$FAILED_JOB_ID" \
+  --launcher iris \
+  --external-system iris \
+  --external-id "$RETRY_JOB_PATH" \
+  --json
+```
+
 Update status flexibly when the external system changes:
 
 ```bash
 uv run fieldbook job update-status "$JOB_ID" --status succeeded --json
+```
+
+Record structured validation evidence for coverage/readiness facts that agents
+need to query later. Use notes for interpretation and `validation-report`
+artifacts for larger supporting tables:
+
+```bash
+REPORT_ID=$(uv run fieldbook artifact add \
+  --experiment "$EXP_ID" \
+  --type validation-report \
+  --uri reports/coverage.md \
+  --json | jq -r .id)
+
+uv run fieldbook validation add \
+  --entity-type experiment \
+  --entity-id "$EXP_ID" \
+  --check-name matrix.coverage.rollup \
+  --status fail \
+  --expected-value "262 rows" \
+  --measured-value "261 rows" \
+  --source-artifact "$REPORT_ID" \
+  --json
 ```
 
 Record Markdown notes:
@@ -277,6 +334,8 @@ uv run fieldbook doctor --json
 uv run fieldbook doctor --list-checks --json
 uv run fieldbook doctor --check stale-jobs --stale-hours 12 --json
 uv run fieldbook doctor --check stale-sessions --stale-session-hours 24 --json
+uv run fieldbook doctor --check job-recovery --stale-unknown-submit-hours 6 --json
+uv run fieldbook doctor --check validations --json
 uv run fieldbook doctor --check ledger-locality --locality-recent-days 7 --json
 ```
 

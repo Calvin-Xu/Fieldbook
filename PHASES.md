@@ -17,6 +17,9 @@ files.
 | 9 | `wandb-writeback` | `tests/test_phase9_wandb_writeback.py` | Opt-in W&B summary writeback with sync-event provenance. |
 | 10 | `workflow-packs-dashboard-readiness` | `tests/test_phase10_workflow_dashboard.py` | Workflow packs, redacted artifact view, and dashboard-readiness contract. |
 | 11 | `agent-sessions-locality` | `tests/test_phase11_agent_sessions_locality.py` | Ledger identity, worktree locality, experiment idempotency, and advisory agent sessions. |
+| 12 | `job-recovery-validations` | `tests/test_phase12_recovery_validation.py` | Job retry/recovery lineage, submission-state lifecycle, blocker-aware status, and structured validation checks. |
+| 13 | `refresh-orchestration` | `tests/test_phase13_refresh_orchestration.py` | Explicit external refresh orchestration through snapshots, pure adapters, and reconcile. |
+| 14 | `privacy-redaction` | `tests/test_phase14_privacy_redaction.py` | Placeholder: write-time privacy policy, redacted views, repair CLI, export preflight scans, and sanitized sharing surfaces. |
 
 ## Numbering Rules
 

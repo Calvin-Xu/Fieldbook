@@ -55,4 +55,4 @@ Do not begin implementation tasks until 1.6 is complete.
 - [x] 6.1 Run OpenSpec validation, py_compile, and full tests.
 - [x] 6.2 Run CC implementation review with `env -u ANTHROPIC_API_KEY claude --resume 23592491-85d8-4d6e-9cd3-3dbe7f265110 --model claude-opus-4-7 --effort max`.
 - [x] 6.3 Patch CC blockers and rerun validation.
-- [ ] 6.4 Commit and push the implementation.
+- [x] 6.4 Commit and push the implementation.

@@ -163,3 +163,11 @@ The system SHALL emit bounded text and structured JSON for refresh operations.
 #### Scenario: Failure output includes next action
 - **WHEN** refresh fails at any stage
 - **THEN** text and JSON output include a suggested next action for inspecting snapshot, debug, manifest, or reconcile error details
+
+#### Scenario: JSON refresh output includes local artifact drift
+- **WHEN** refresh observes local artifact drift for artifacts in the refreshed scope
+- **THEN** the JSON envelope includes bounded `drifted_artifacts` entries with artifact ID, URI, captured metadata, observed metadata, and suggested action
+
+#### Scenario: Text refresh output summarizes local artifact drift
+- **WHEN** refresh observes local artifact drift for artifacts in the refreshed scope
+- **THEN** text output includes a compact drift count and points agents to `artifact refresh-local` or `doctor`

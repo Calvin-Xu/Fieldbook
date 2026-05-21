@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -30,6 +31,11 @@ def _job_json_command(job_id: str, status: str, external_id: str) -> list[str]:
         f"'external_id': {external_id!r}, 'name': 'iris refresh'}}]}}))"
     )
     return [sys.executable, "-c", script]
+
+
+def _touch_future(path: Path) -> None:
+    future = path.stat().st_mtime + 10.0
+    os.utime(path, (future, future))
 
 
 def test_refresh_config_listing_and_source_validation(tmp_path: Path) -> None:
@@ -245,3 +251,41 @@ def test_refresh_failure_stages_and_doctor_checks(tmp_path: Path) -> None:
         conn.close()
     doctor = payload(run_fieldbook(ledger, "doctor", check=False))
     assert "refresh.snapshot_missing" in {issue["code"] for issue in doctor["issues"]}
+
+
+def test_refresh_output_includes_drifted_artifacts(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    experiment_id = create_experiment(ledger)
+    local_report = tmp_path / "report.md"
+    local_report.write_text("initial\n", encoding="utf-8")
+    artifact = payload(
+        run_fieldbook(
+            ledger,
+            "artifact",
+            "add",
+            "--experiment",
+            experiment_id,
+            "--type",
+            "report",
+            "--uri",
+            str(local_report),
+        )
+    )
+    local_report.write_text("changed\n", encoding="utf-8")
+    _touch_future(local_report)
+    snapshot = tmp_path / "jobs.json"
+    snapshot.write_text('{"jobs": []}\n', encoding="utf-8")
+    _write_refresh_config(
+        tmp_path,
+        f"""
+        [sources.iris_jobs]
+        kind = "file"
+        adapter = "iris-jobs-json"
+        path = {_toml_string(str(snapshot))}
+        description = "Refresh Iris job summaries."
+        """,
+    )
+
+    result = payload(run_fieldbook(ledger, "refresh", "run", "--source", "iris_jobs", "--experiment", experiment_id))
+    assert result["drifted_artifacts"][0]["id"] == artifact["id"]
+    assert result["drifted_artifacts"][0]["uri"] == str(local_report)

@@ -70,8 +70,8 @@ uv run fieldbook experiment triage "$EXP_ID" --json
 ```
 
 Use the status payload to identify stale running jobs, failed jobs, key
-artifacts, open handoffs, open next actions, open debug notes, and recent
-research/decision previews. Use context for full Markdown note bodies. Then
+artifacts, freshness counts, open handoffs, open next actions, open debug notes,
+and recent research/decision previews. Use context for full Markdown note bodies. Then
 inspect only the relevant entities:
 
 ```bash
@@ -79,6 +79,28 @@ uv run fieldbook job show "$JOB_ID" --json
 uv run fieldbook run show "$RUN_ID" --json
 uv run fieldbook note list --entity-type experiment --entity-id "$EXP_ID" --status open --json
 uv run fieldbook note show "$NOTE_ID" --json
+```
+
+Before leaving an experiment, write a checkpoint:
+
+```bash
+uv run fieldbook experiment checkpoint "$EXP_ID" --body-file /tmp/checkpoint.md --json
+```
+
+Use `--archive` when the checkpoint should close the experiment. Archived
+experiments reject normal writes; use `--errata` only for explicit
+post-archive notes, artifacts, validations, or checkpoints. Errata rows are
+visible in status/context under historical evidence and do not reactivate the
+experiment.
+
+Local-file artifacts are freshness-tracked. If status/context, refresh output,
+or doctor reports drift, inspect the file and then either regenerate the
+artifact, rerun the validation, or refresh the captured metadata:
+
+```bash
+uv run fieldbook doctor --check artifact.local_drift --json
+uv run fieldbook artifact refresh-local "$ARTIFACT_ID" --update-hash --json
+uv run fieldbook doctor --check validation.source_drift --json
 ```
 
 If external job or metric state may have changed, refresh explicitly rather

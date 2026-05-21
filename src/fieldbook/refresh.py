@@ -9,6 +9,7 @@ from typing import Any
 
 from fieldbook.adapters import AdapterFailure, run_adapter
 from fieldbook.errors import ValidationError
+from fieldbook.freshness import drifted_artifacts
 from fieldbook.ids import new_id
 from fieldbook.reconcile import reconcile_manifest
 from fieldbook.repository import Repository
@@ -225,6 +226,7 @@ def _run_one_source(
     _write_json(paths["debug"], adapter_run.debug_payload())
 
     submission_resolutions = _submission_resolutions(repo.conn, adapter_run.manifest, experiment_id=experiment_id)
+    drifted = drifted_artifacts(repo.conn, experiment_id=experiment_id, cwd=Path.cwd(), limit=20)
     try:
         reconcile_result = reconcile_manifest(
             repo,
@@ -246,6 +248,7 @@ def _run_one_source(
             command_argv=command_argv,
             error_message=str(exc),
             submission_resolutions=submission_resolutions,
+            drifted_artifacts=drifted,
         )
     reconcile_event_id = None
     if apply:
@@ -262,6 +265,7 @@ def _run_one_source(
         command_argv=command_argv,
         reconcile_event_id=reconcile_event_id,
         submission_resolutions=submission_resolutions,
+        drifted_artifacts=drifted,
     )
 
 
@@ -366,6 +370,7 @@ def _finalize_refresh(
     error_message: str | None = None,
     reconcile_event_id: str | None = None,
     submission_resolutions: list[dict[str, Any]] | None = None,
+    drifted_artifacts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     finished_at = utc_now()
     event_id = new_id("refresh")
@@ -400,6 +405,7 @@ def _finalize_refresh(
             "event_id": event_id,
             "counts": counts,
             "submission_resolutions": submission_resolutions or [],
+            "drifted_artifacts": drifted_artifacts or [],
             "suggested_next_action": _suggested_next_action(status=status, stage=stage),
             "truncated": False,
         }

@@ -251,7 +251,8 @@ uv run fieldbook experiment triage "$EXP_ID" --json
 ```
 
 `status` is the compact navigation surface for agents: counts, failed/stale
-jobs, retry/recovery readiness, validation summaries, key artifacts, and note previews. `context` is the LLM-ready Markdown
+jobs, retry/recovery readiness, validation summaries, key artifacts, freshness
+counts, and note previews. `context` is the LLM-ready Markdown
 handoff surface with full bodies for active handoff, next-action, and debug
 notes plus recent research and decision notes.
 
@@ -316,6 +317,39 @@ uv run fieldbook note add \
   --json
 
 uv run fieldbook note show "$NOTE_ID" --json
+```
+
+Before context switching or archiving, write a checkpoint. Checkpoints are
+Markdown notes that include a generated freshness summary. Archived experiments
+are closed by default; use `--errata` only for explicit post-archive evidence.
+
+```bash
+uv run fieldbook experiment checkpoint "$EXP_ID" \
+  --body-file /tmp/fieldbook-checkpoint.md \
+  --json
+
+uv run fieldbook experiment checkpoint "$EXP_ID" \
+  --archive \
+  --json
+
+uv run fieldbook note add \
+  --entity-type experiment \
+  --entity-id "$ARCHIVED_EXP_ID" \
+  --type research \
+  --body "Post-archive correction." \
+  --errata \
+  --json
+```
+
+Local-file artifacts record mtime and size when added. If a local artifact was
+regenerated or edited, doctor reports drift and refresh output includes bounded
+`drifted_artifacts` entries when the artifact is in scope. Refresh the metadata
+after deciding the drift is expected:
+
+```bash
+uv run fieldbook doctor --check artifact.local_drift --json
+uv run fieldbook artifact refresh-local "$ARTIFACT_ID" --update-hash --json
+uv run fieldbook doctor --check validation.source_drift --json
 ```
 
 Refresh external state explicitly through snapshots:

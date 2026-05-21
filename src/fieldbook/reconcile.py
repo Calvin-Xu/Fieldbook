@@ -44,7 +44,7 @@ ENTITY_ORDER = {
     "custom_attributes": 6,
     "sync_events": 7,
 }
-ACTION_ORDER = {"insert": 0, "update": 1, "sync_event": 2, "noop": 3, "archive": 4}
+ACTION_ORDER = {"insert": 0, "errata_replace": 1, "update": 2, "sync_event": 3, "noop": 4, "archive": 5}
 NOTE_AUDIT_PREVIEW_CHARS = 200
 
 ENTITY_KEYS = {
@@ -92,7 +92,7 @@ def reconcile_manifest(
     if not apply:
         repo.conn.execute("BEGIN")
         try:
-            plan = _plan(repo.conn, manifest, experiment_id)
+            plan = _plan(repo.conn, manifest, experiment_id, session_id=repo.current_session_id)
         finally:
             repo.conn.rollback()
         return {
@@ -105,7 +105,7 @@ def reconcile_manifest(
     session_id = repo.current_session_id
     repo.conn.execute("BEGIN IMMEDIATE")
     try:
-        plan = _plan(repo.conn, manifest, experiment_id)
+        plan = _plan(repo.conn, manifest, experiment_id, session_id=session_id)
         event_id = new_id("rec")
         now = utc_now()
         repo.conn.execute(
@@ -204,7 +204,13 @@ def _load_csv_manifest(path: Path) -> dict[str, list[dict[str, Any]]]:
     return result
 
 
-def _plan(conn: sqlite3.Connection, manifest: dict[str, list[dict[str, Any]]], experiment_id: str | None) -> dict[str, Any]:
+def _plan(
+    conn: sqlite3.Connection,
+    manifest: dict[str, list[dict[str, Any]]],
+    experiment_id: str | None,
+    *,
+    session_id: str | None,
+) -> dict[str, Any]:
     operations: list[dict[str, Any]] = []
     normalized_manifest = {
         **manifest,
@@ -219,16 +225,16 @@ def _plan(conn: sqlite3.Connection, manifest: dict[str, list[dict[str, Any]]], e
         operations.append(_plan_job(conn, job, experiment_id, order=order))
         order += 1
     for artifact in normalized_manifest.get("artifacts", []):
-        operations.append(_plan_artifact(conn, artifact, experiment_id, order=order))
+        operations.append(_plan_artifact(conn, artifact, experiment_id, order=order, session_id=session_id))
         order += 1
     for metric in normalized_manifest.get("metrics", []):
         operations.append(_plan_metric(conn, metric, order=order))
         order += 1
     for note in normalized_manifest.get("notes", []):
-        operations.append(_plan_note(conn, note, order=order))
+        operations.append(_plan_note(conn, note, order=order, session_id=session_id))
         order += 1
     for validation in normalized_manifest.get("validations", []):
-        operations.append(_plan_validation(conn, validation, order=order))
+        operations.append(_plan_validation(conn, validation, order=order, session_id=session_id))
         order += 1
     for custom_attr in normalized_manifest.get("custom_attributes", []):
         operations.append(_plan_custom_attrs(conn, custom_attr, order=order))
@@ -277,6 +283,9 @@ def _counts(operations: list[dict[str, Any]]) -> dict[str, Any]:
         action = operation["action"]
         if action == "sync_event":
             sync_event_count += 1
+        elif action == "errata_replace":
+            counters["archive"][operation["entity"]] += 1
+            counters["insert"][operation["entity"]] += 1
         elif action in counters:
             counters[action][operation["entity"]] += 1
     return {
@@ -336,8 +345,17 @@ def _row_op(row: dict[str, Any], *, entity: str) -> str:
     return op
 
 
+def _row_errata(row: dict[str, Any], *, entity: str) -> bool:
+    value = row.get("_errata", False)
+    if value not in {True, False}:
+        raise ValidationError("_errata must be true or false")
+    if value and entity in {"jobs", "metrics"}:
+        raise ValidationError(f"{entity} do not support _errata")
+    return bool(value)
+
+
 def _clean_row(row: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in row.items() if key != "_op"}
+    return {key: value for key, value in row.items() if key not in {"_op", "_errata"}}
 
 
 def _plan_run(conn: sqlite3.Connection, row: dict[str, Any], experiment_id: str | None, *, order: int) -> dict[str, Any]:
@@ -372,6 +390,7 @@ def _plan_run(conn: sqlite3.Connection, row: dict[str, Any], experiment_id: str 
 
 def _plan_job(conn: sqlite3.Connection, row: dict[str, Any], experiment_id: str | None, *, order: int) -> dict[str, Any]:
     op = _row_op(row, entity="jobs")
+    _row_errata(row, entity="jobs")
     clean = _clean_row(row)
     existing = _find_entity(conn, "jobs", clean)
     if op == "archive":
@@ -410,19 +429,64 @@ def _plan_job(conn: sqlite3.Connection, row: dict[str, Any], experiment_id: str 
     return _operation(entity="jobs", action="insert", entity_id=job_id, row=planned, order=order)
 
 
-def _plan_artifact(conn: sqlite3.Connection, row: dict[str, Any], experiment_id: str | None, *, order: int) -> dict[str, Any]:
+def _plan_artifact(
+    conn: sqlite3.Connection,
+    row: dict[str, Any],
+    experiment_id: str | None,
+    *,
+    order: int,
+    session_id: str | None,
+) -> dict[str, Any]:
     op = _row_op(row, entity="artifacts")
+    errata = _row_errata(row, entity="artifacts")
     clean = _clean_row(row)
     existing = _find_entity(conn, "artifacts", clean)
     if op == "archive":
         return _archive_operation("artifacts", clean, existing, order=order)
     require_choice(clean["type"], ARTIFACT_TYPES, "artifact type")
     validate_content_hash(clean.get("content_hash"))
-    artifact_id = existing["id"] if existing else clean.get("id", new_id("art"))
+    artifact_id = clean.get("id", new_id("art")) if errata else (existing["id"] if existing else clean.get("id", new_id("art")))
+    if existing and errata and artifact_id == existing["id"]:
+        artifact_id = new_id("art")
     target_experiment_id = clean.get("experiment_id", experiment_id)
-    _require_active_experiment(conn, target_experiment_id)
+    _require_active_experiment(conn, target_experiment_id, allow_archived=errata)
+    archived_targets = _archived_experiment_ids_for_artifact_target(
+        conn,
+        experiment_id=target_experiment_id,
+        run_id=clean.get("run_id"),
+        job_id=clean.get("job_id"),
+    )
+    if archived_targets and not errata:
+        raise ValidationError(f"artifact targets archived experiment(s) and requires _errata: {', '.join(sorted(archived_targets))}")
     planned = {**clean, "id": artifact_id, "experiment_id": target_experiment_id}
+    if errata:
+        planned["attrs"] = _errata_attrs(
+            planned.get("attrs", {}),
+            replaces=existing["id"] if existing else None,
+            session_id=session_id,
+        )
+        if existing:
+            target_owner_ids = _artifact_target_experiment_ids(
+                conn,
+                experiment_id=target_experiment_id,
+                run_id=clean.get("run_id"),
+                job_id=clean.get("job_id"),
+            )
+            existing_owner_ids = _artifact_row_experiment_ids(conn, existing)
+            if target_owner_ids and existing_owner_ids and not (target_owner_ids & existing_owner_ids):
+                raise ValidationError(f"artifact URI already exists outside the errata target experiments: {clean['uri']}")
+            return _operation(
+                entity="artifacts",
+                action="errata_replace",
+                entity_id=artifact_id,
+                row=planned,
+                existing=existing,
+                order=order,
+                diff={"replaces": [existing["id"], artifact_id]},
+            )
     if existing:
+        if _archived_experiment_ids_for_artifact_row(conn, existing):
+            raise ValidationError("reconcile updates against archived artifact targets are not allowed")
         if "attrs" not in planned:
             planned["attrs"] = load_attrs(existing["attrs_json"])
         diff = _row_diff(
@@ -443,8 +507,15 @@ def _plan_artifact(conn: sqlite3.Connection, row: dict[str, Any], experiment_id:
     return _operation(entity="artifacts", action="insert", entity_id=artifact_id, row=planned, order=order)
 
 
-def _plan_validation(conn: sqlite3.Connection, row: dict[str, Any], *, order: int) -> dict[str, Any]:
+def _plan_validation(
+    conn: sqlite3.Connection,
+    row: dict[str, Any],
+    *,
+    order: int,
+    session_id: str | None,
+) -> dict[str, Any]:
     op = _row_op(row, entity="validations")
+    errata = _row_errata(row, entity="validations")
     clean = _clean_row(row)
     existing = _find_entity(conn, "validations", clean)
     if op == "archive":
@@ -453,7 +524,12 @@ def _plan_validation(conn: sqlite3.Connection, row: dict[str, Any], *, order: in
     require_choice(clean["status"], VALIDATION_STATUSES, "validation status")
     if not clean.get("entity_id") or not clean.get("check_name"):
         raise ValidationError("validation reconcile rows require entity_type, entity_id, check_name, and status")
-    if not _entity_exists(conn, clean["entity_type"], clean["entity_id"]):
+    if not _entity_exists(conn, clean["entity_type"], clean["entity_id"], active_only=False):
+        raise ValidationError(f"validation entity does not exist: {clean['entity_type']}:{clean['entity_id']}")
+    archived_targets = _archived_experiment_ids_for_entity(conn, clean["entity_type"], clean["entity_id"])
+    if archived_targets and not errata:
+        raise ValidationError(f"validation targets archived experiment(s) and requires _errata: {', '.join(sorted(archived_targets))}")
+    if not errata and not _entity_exists(conn, clean["entity_type"], clean["entity_id"], active_only=True):
         raise ValidationError(f"validation entity does not exist: {clean['entity_type']}:{clean['entity_id']}")
     details = clean.get("details", clean.get("details_json", {}))
     if isinstance(details, str):
@@ -465,9 +541,29 @@ def _plan_validation(conn: sqlite3.Connection, row: dict[str, Any], *, order: in
         raise ValidationError(f"validation source_artifact_id does not exist: {clean['source_artifact_id']}")
     if clean.get("source_job_id") and not _active_row_exists(conn, "jobs", clean["source_job_id"]):
         raise ValidationError(f"validation source_job_id does not exist: {clean['source_job_id']}")
-    validation_id = existing["id"] if existing else clean.get("id", new_id("val"))
+    validation_id = clean.get("id", new_id("val")) if errata else (existing["id"] if existing else clean.get("id", new_id("val")))
+    if existing and errata and validation_id == existing["id"]:
+        validation_id = new_id("val")
     planned = {**clean, "id": validation_id}
+    if errata:
+        planned["attrs"] = _errata_attrs(
+            planned.get("attrs", {}),
+            replaces=existing["id"] if existing else None,
+            session_id=session_id,
+        )
+        if existing:
+            return _operation(
+                entity="validations",
+                action="errata_replace",
+                entity_id=validation_id,
+                row=planned,
+                existing=existing,
+                order=order,
+                diff={"replaces": [existing["id"], validation_id]},
+            )
     if existing:
+        if _archived_experiment_ids_for_entity(conn, existing["entity_type"], existing["entity_id"]):
+            raise ValidationError("reconcile updates against archived validation targets are not allowed")
         if "attrs" not in planned:
             planned["attrs"] = load_attrs(existing["attrs_json"])
         diff = _row_diff(
@@ -503,6 +599,7 @@ def _plan_validation(conn: sqlite3.Connection, row: dict[str, Any], *, order: in
 
 def _plan_metric(conn: sqlite3.Connection, row: dict[str, Any], *, order: int) -> dict[str, Any]:
     op = _row_op(row, entity="metrics")
+    _row_errata(row, entity="metrics")
     clean = _clean_row(row)
     existing = _find_entity(conn, "metrics", clean)
     if op == "archive":
@@ -524,8 +621,9 @@ def _plan_metric(conn: sqlite3.Connection, row: dict[str, Any], *, order: int) -
     return _operation(entity="metrics", action="insert", entity_id=metric_id, row=planned, order=order)
 
 
-def _plan_note(conn: sqlite3.Connection, row: dict[str, Any], *, order: int) -> dict[str, Any]:
+def _plan_note(conn: sqlite3.Connection, row: dict[str, Any], *, order: int, session_id: str | None) -> dict[str, Any]:
     op = _row_op(row, entity="notes")
+    errata = _row_errata(row, entity="notes")
     clean = _clean_row(row)
     existing = _find_entity(conn, "notes", clean)
     if op == "archive":
@@ -533,6 +631,9 @@ def _plan_note(conn: sqlite3.Connection, row: dict[str, Any], *, order: int) -> 
     if not clean.get("entity_type") or not clean.get("note_type"):
         raise ValidationError("note reconcile rows require entity_type and note_type")
     require_choice(clean["entity_type"], ENTITY_TYPES, "entity type")
+    archived_targets = _archived_experiment_ids_for_entity(conn, clean["entity_type"], clean["entity_id"])
+    if archived_targets and not errata:
+        raise ValidationError(f"note targets archived experiment(s) and requires _errata: {', '.join(sorted(archived_targets))}")
     require_choice(clean["note_type"], NOTE_TYPES, "note type")
     require_choice(clean.get("status", "open"), NOTE_STATUSES, "note status")
     title = validate_note_title(clean.get("title"))
@@ -541,6 +642,8 @@ def _plan_note(conn: sqlite3.Connection, row: dict[str, Any], *, order: int) -> 
         raise ValidationError("note reconcile rows require body")
     note_id = existing["id"] if existing else clean.get("id", new_id("note"))
     planned = {**clean, "id": note_id, "title": title}
+    if errata:
+        planned["attrs"] = _errata_attrs(planned.get("attrs", {}), session_id=session_id)
     if body is not None:
         planned["body"] = body
     if "body_format" in clean:
@@ -548,6 +651,8 @@ def _plan_note(conn: sqlite3.Connection, row: dict[str, Any], *, order: int) -> 
     elif existing is None:
         planned["body_format"] = "markdown"
     if existing:
+        if _archived_experiment_ids_for_entity(conn, existing["entity_type"], existing["entity_id"]):
+            raise ValidationError("reconcile updates against archived note targets are not allowed")
         if "attrs" not in planned:
             planned["attrs"] = load_attrs(existing["attrs_json"])
         diff = _row_diff(
@@ -662,9 +767,11 @@ def _active_row_exists(conn: sqlite3.Connection, table: str, row_id: str) -> boo
     return bool(conn.execute(f"SELECT 1 FROM {table} WHERE id = ? AND deleted_at IS NULL", (row_id,)).fetchone())
 
 
-def _entity_exists(conn: sqlite3.Connection, entity_type: str, entity_id: str) -> bool:
+def _entity_exists(conn: sqlite3.Connection, entity_type: str, entity_id: str, *, active_only: bool = True) -> bool:
     table = _table_for_entity_type(entity_type)
-    return _active_row_exists(conn, table, entity_id)
+    if active_only:
+        return _active_row_exists(conn, table, entity_id)
+    return bool(conn.execute(f"SELECT 1 FROM {table} WHERE id = ?", (entity_id,)).fetchone())
 
 
 def _validate_retry_operations(conn: sqlite3.Connection, operations: list[dict[str, Any]]) -> None:
@@ -704,14 +811,123 @@ def _validate_parent_run(conn: sqlite3.Connection, run_id: str, parent_run_id: s
         raise ValidationError(f"parent_run_id does not reference an existing run: {parent_run_id}")
 
 
-def _require_active_experiment(conn: sqlite3.Connection, experiment_id: str | None) -> None:
+def _require_active_experiment(conn: sqlite3.Connection, experiment_id: str | None, *, allow_archived: bool = False) -> None:
     if experiment_id is None:
         return
     row = conn.execute("SELECT deleted_at FROM experiments WHERE id = ?", (experiment_id,)).fetchone()
     if row is None:
         raise ValidationError(f"experiment not found: {experiment_id}")
-    if row["deleted_at"] is not None:
+    if row["deleted_at"] is not None and not allow_archived:
         raise ValidationError(f"experiment is archived/deleted and cannot be reconciled: {experiment_id}")
+
+
+def _owner_experiment_ids_for_entity(conn: sqlite3.Connection, entity_type: str, entity_id: str) -> set[str]:
+    require_choice(entity_type, ENTITY_TYPES, "entity type")
+    if entity_type == "experiment":
+        return {entity_id}
+    if entity_type == "run":
+        return {
+            str(row["experiment_id"])
+            for row in conn.execute("SELECT experiment_id FROM experiment_runs WHERE run_id = ?", (entity_id,)).fetchall()
+        }
+    if entity_type == "job":
+        row = conn.execute("SELECT experiment_id, run_id FROM jobs WHERE id = ?", (entity_id,)).fetchone()
+        if row is None:
+            return set()
+        result = {str(row["experiment_id"])} if row["experiment_id"] else set()
+        if row["run_id"]:
+            result.update(_owner_experiment_ids_for_entity(conn, "run", str(row["run_id"])))
+        return result
+    if entity_type == "artifact":
+        row = conn.execute("SELECT * FROM artifacts WHERE id = ?", (entity_id,)).fetchone()
+        return _artifact_row_experiment_ids(conn, row) if row else set()
+    if entity_type == "metric":
+        row = conn.execute("SELECT run_id FROM metrics WHERE id = ?", (entity_id,)).fetchone()
+        return _owner_experiment_ids_for_entity(conn, "run", str(row["run_id"])) if row else set()
+    return set()
+
+
+def _archived_experiment_ids_for_entity(conn: sqlite3.Connection, entity_type: str, entity_id: str) -> set[str]:
+    owner_ids = _owner_experiment_ids_for_entity(conn, entity_type, entity_id)
+    if not owner_ids:
+        return set()
+    placeholders = ", ".join("?" for _ in owner_ids)
+    rows = conn.execute(
+        f"SELECT id FROM experiments WHERE id IN ({placeholders}) AND deleted_at IS NOT NULL",
+        tuple(owner_ids),
+    ).fetchall()
+    return {str(row["id"]) for row in rows}
+
+
+def _archived_experiment_ids_for_artifact_target(
+    conn: sqlite3.Connection,
+    *,
+    experiment_id: str | None,
+    run_id: str | None,
+    job_id: str | None,
+) -> set[str]:
+    owner_ids = {experiment_id} if experiment_id else set()
+    if run_id:
+        owner_ids.update(_owner_experiment_ids_for_entity(conn, "run", run_id))
+    if job_id:
+        owner_ids.update(_owner_experiment_ids_for_entity(conn, "job", job_id))
+    if not owner_ids:
+        return set()
+    placeholders = ", ".join("?" for _ in owner_ids)
+    rows = conn.execute(
+        f"SELECT id FROM experiments WHERE id IN ({placeholders}) AND deleted_at IS NOT NULL",
+        tuple(owner_ids),
+    ).fetchall()
+    return {str(row["id"]) for row in rows}
+
+
+def _artifact_target_experiment_ids(
+    conn: sqlite3.Connection,
+    *,
+    experiment_id: str | None,
+    run_id: str | None,
+    job_id: str | None,
+) -> set[str]:
+    result = {experiment_id} if experiment_id else set()
+    if run_id:
+        result.update(_owner_experiment_ids_for_entity(conn, "run", run_id))
+    if job_id:
+        result.update(_owner_experiment_ids_for_entity(conn, "job", job_id))
+    return {str(owner_id) for owner_id in result if owner_id}
+
+
+def _artifact_row_experiment_ids(conn: sqlite3.Connection, row: sqlite3.Row) -> set[str]:
+    result = {str(row["experiment_id"])} if row["experiment_id"] else set()
+    if row["run_id"]:
+        result.update(_owner_experiment_ids_for_entity(conn, "run", str(row["run_id"])))
+    if row["job_id"]:
+        result.update(_owner_experiment_ids_for_entity(conn, "job", str(row["job_id"])))
+    return result
+
+
+def _archived_experiment_ids_for_artifact_row(conn: sqlite3.Connection, row: sqlite3.Row) -> set[str]:
+    owner_ids = _artifact_row_experiment_ids(conn, row)
+    if not owner_ids:
+        return set()
+    placeholders = ", ".join("?" for _ in owner_ids)
+    rows = conn.execute(
+        f"SELECT id FROM experiments WHERE id IN ({placeholders}) AND deleted_at IS NOT NULL",
+        tuple(owner_ids),
+    ).fetchall()
+    return {str(row["id"]) for row in rows}
+
+
+def _errata_attrs(attrs: dict[str, Any], *, replaces: str | None = None, session_id: str | None = None) -> dict[str, Any]:
+    result = {
+        **attrs,
+        "fieldbook.erratum": True,
+        "fieldbook.erratum_at": utc_now(),
+    }
+    if session_id:
+        result["fieldbook.erratum_session_id"] = session_id
+    if replaces:
+        result["fieldbook.replaces"] = replaces
+    return result
 
 
 def _run_link_exists(conn: sqlite3.Connection, experiment_id: str, run_id: str) -> bool:
@@ -756,6 +972,8 @@ def _apply_plan(
             _apply_run(conn, operation)
         elif entity == "jobs":
             _apply_job(conn, operation)
+        elif operation["action"] == "errata_replace":
+            _apply_errata_replace(conn, operation, session_id=session_id)
         elif entity == "artifacts":
             _apply_artifact(conn, operation)
         elif entity == "metrics":
@@ -871,10 +1089,28 @@ def _apply_job(conn: sqlite3.Connection, operation: dict[str, Any]) -> None:
         )
 
 
+def _apply_errata_replace(conn: sqlite3.Connection, operation: dict[str, Any], *, session_id: str | None) -> None:
+    existing = operation["existing"]
+    if existing is None:
+        raise ValidationError("errata replacement requires an existing row")
+    now = utc_now()
+    conn.execute(
+        f"UPDATE {operation['entity']} SET deleted_at = COALESCE(deleted_at, ?), updated_at = ? WHERE id = ?",
+        (now, now, existing["id"]),
+    )
+    if operation["entity"] == "artifacts":
+        _apply_artifact(conn, operation)
+        return
+    if operation["entity"] == "validations":
+        _apply_validation(conn, operation, session_id=session_id)
+        return
+    raise ValidationError(f"unsupported errata replacement entity: {operation['entity']}")
+
+
 def _apply_artifact(conn: sqlite3.Connection, operation: dict[str, Any]) -> None:
     row = operation["row"]
     now = utc_now()
-    if operation["action"] == "insert":
+    if operation["action"] in {"insert", "errata_replace"}:
         conn.execute(
             "INSERT INTO artifacts (id, experiment_id, run_id, job_id, type, uri, content_hash, created_at, "
             "updated_at, attrs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -981,7 +1217,7 @@ def _apply_validation(conn: sqlite3.Connection, operation: dict[str, Any], *, se
     row = operation["row"]
     attrs = dict(row.get("attrs", {}))
     now = utc_now()
-    if operation["action"] == "insert":
+    if operation["action"] in {"insert", "errata_replace"}:
         conn.execute(
             "INSERT INTO validations (id, entity_type, entity_id, check_name, status, expected_value, measured_value, "
             "details_json, source_artifact_id, source_job_id, session_id, created_at, updated_at, attrs_json) "

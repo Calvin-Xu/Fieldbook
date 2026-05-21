@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from fieldbook.errors import AmbiguityError, NotFoundError, ValidationError
+from fieldbook.freshness import attrs_with_local_capture, experiment_freshness, local_artifact_metadata
 from fieldbook.git_info import current_git_revision
 from fieldbook.ids import new_id
 from fieldbook.time_utils import utc_now
@@ -109,6 +110,45 @@ class Repository:
             )
         return self.get_experiment(experiment["id"])
 
+    def checkpoint_experiment(
+        self,
+        ref: str,
+        *,
+        body: str | None,
+        archive: bool,
+        errata: bool,
+        stale_hours: float = 24.0,
+    ) -> dict[str, Any]:
+        experiment = self.get_experiment(ref)
+        freshness = experiment_freshness(
+            self.conn,
+            experiment_id=experiment["id"],
+            cwd=Path.cwd(),
+            stale_checkpoint_hours=stale_hours,
+        )
+        note_body = self._checkpoint_body(body=body, freshness=freshness)
+        note = self.add_note(
+            entity_type="experiment",
+            entity_ref=experiment["id"],
+            note_type="checkpoint",
+            status="open",
+            title="Experiment checkpoint",
+            body=note_body,
+            body_format="markdown",
+            author=None,
+            attrs={},
+            errata=errata,
+        )
+        if archive:
+            experiment = self.archive_experiment(experiment["id"])
+        else:
+            experiment = self.get_experiment(experiment["id"])
+        return {
+            "experiment": experiment,
+            "note": note,
+            "freshness": freshness,
+        }
+
     def experiment_status(self, ref: str, *, stale_hours: float = 24.0) -> dict[str, Any]:
         experiment = self.get_experiment(ref)
         experiment_id = experiment["id"]
@@ -166,6 +206,8 @@ class Repository:
         ).fetchall()
         validation_summary = self._validation_summary(validation_rows)
         artifact_rows = self._experiment_artifact_rows(experiment_id, limit=20)
+        errata_rows = self._experiment_errata_rows(experiment_id, limit=20)
+        freshness = experiment_freshness(self.conn, experiment_id=experiment_id, cwd=Path.cwd(), stale_checkpoint_hours=stale_hours)
         active_job_count = sum(job_counts.get(status, 0) for status in ("submitting", "unknown_submit", "queued", "running"))
         has_active_blockers = bool(blocker_rows or validation_summary["failed"] or validation_summary["unknown_blocking"])
         return {
@@ -194,6 +236,15 @@ class Repository:
             "submission_unknown_jobs": [self._job_dict(row) for row in unknown_submit_rows],
             "validations": validation_summary,
             "key_artifacts": [self._artifact_dict(row) for row in artifact_rows],
+            "freshness": {
+                key: value
+                for key, value in freshness.items()
+                if key not in {"drifted_artifacts", "stale_validations"}
+            },
+            "historical": {
+                "erratum_count": self._experiment_errata_count(experiment_id),
+                "recent_errata": errata_rows,
+            },
         }
 
     def experiment_context(self, ref: str, *, stale_hours: float = 24.0) -> dict[str, Any]:
@@ -245,7 +296,18 @@ class Repository:
                     limit=CONTEXT_RECENT_NOTE_LIMIT,
                 )
             ],
+            "recent_checkpoints": [
+                self._note_dict(row)
+                for row in self._note_rows(
+                    experiment_id,
+                    note_type="checkpoint",
+                    status=None,
+                    limit=CONTEXT_RECENT_NOTE_LIMIT,
+                )
+            ],
         }
+        freshness = experiment_freshness(self.conn, experiment_id=experiment_id, cwd=Path.cwd(), stale_checkpoint_hours=stale_hours)
+        status["freshness"] = freshness
         return status
 
     def add_run(
@@ -505,8 +567,10 @@ class Repository:
         source_artifact_ref: str | None,
         source_job_ref: str | None,
         attrs: dict[str, Any],
+        errata: bool = False,
     ) -> dict[str, Any]:
-        entity_id = self._active_entity_id(entity_type, entity_ref)
+        entity_id = self._resolve_entity_id(entity_type, entity_ref) if errata else self._active_entity_id(entity_type, entity_ref)
+        self._validate_post_archive_write(entity_type, entity_id, errata=errata, label="validation")
         require_choice(status, VALIDATION_STATUSES, "validation status")
         if not check_name.strip():
             raise ValidationError("validation check_name must not be empty")
@@ -520,8 +584,37 @@ class Repository:
             "SELECT * FROM validations WHERE entity_type = ? AND entity_id = ? AND check_name = ? AND deleted_at IS NULL",
             (entity_type, entity_id, check_name),
         ).fetchone()
+        if errata:
+            attrs = self._errata_attrs(attrs, now=now, replaces=existing["id"] if existing else None)
         with self.conn:
-            if existing:
+            if existing and errata:
+                self.conn.execute(
+                    "UPDATE validations SET deleted_at = COALESCE(deleted_at, ?), updated_at = ? WHERE id = ?",
+                    (now, now, existing["id"]),
+                )
+                validation_id = new_id("val")
+                self.conn.execute(
+                    "INSERT INTO validations (id, entity_type, entity_id, check_name, status, expected_value, "
+                    "measured_value, details_json, source_artifact_id, source_job_id, session_id, created_at, "
+                    "updated_at, attrs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        validation_id,
+                        entity_type,
+                        entity_id,
+                        check_name,
+                        status,
+                        expected_value,
+                        measured_value,
+                        attrs_json(details),
+                        source_artifact_id,
+                        source_job_id,
+                        self.current_session_id,
+                        now,
+                        now,
+                        attrs_json(attrs),
+                    ),
+                )
+            elif existing:
                 validation_id = existing["id"]
                 self.conn.execute(
                     "UPDATE validations SET status = ?, expected_value = ?, measured_value = ?, details_json = ?, "
@@ -615,23 +708,61 @@ class Repository:
         content_hash: str | None,
         attrs: dict[str, Any],
         update_existing: bool = False,
+        errata: bool = False,
     ) -> dict[str, Any]:
         require_choice(artifact_type, ARTIFACT_TYPES, "artifact type")
         validate_content_hash(content_hash)
-        experiment_id = self._active_experiment_id(experiment_ref) if experiment_ref else None
+        experiment_id = self._experiment_id_for_artifact_target(experiment_ref, errata=errata) if experiment_ref else None
         run_id = self.get_run(run_ref)["id"] if run_ref else None
         job_id = self.get_job(job_ref)["id"] if job_ref else None
         if not experiment_id and not run_id and not job_id:
             raise ValidationError("artifact requires --experiment, --run, or --job")
+        self._validate_artifact_targets_post_archive(
+            experiment_id=experiment_id,
+            run_id=run_id,
+            job_id=job_id,
+            errata=errata,
+        )
+        attrs = attrs_with_local_capture(attrs, uri=uri, cwd=Path.cwd())
         existing = self.conn.execute(
-            "SELECT id FROM artifacts WHERE uri = ? AND deleted_at IS NULL",
+            "SELECT * FROM artifacts WHERE uri = ? AND deleted_at IS NULL",
             (uri,),
         ).fetchone()
+        if existing and errata:
+            target_owner_ids = self._artifact_target_experiment_ids(experiment_id=experiment_id, run_id=run_id, job_id=job_id)
+            existing_owner_ids = self._artifact_row_experiment_ids(existing)
+            if target_owner_ids and existing_owner_ids and not (target_owner_ids & existing_owner_ids):
+                raise AmbiguityError(f"artifact URI already exists outside the errata target experiments as {existing['id']}: {uri}")
         if existing and not update_existing:
-            raise AmbiguityError(f"artifact URI already exists as {existing['id']}: {uri}")
+            if not errata:
+                raise AmbiguityError(f"artifact URI already exists as {existing['id']}: {uri}")
         now = utc_now()
+        if errata:
+            attrs = self._errata_attrs(attrs, now=now, replaces=existing["id"] if existing else None)
         with self.conn:
-            if existing:
+            if existing and errata:
+                self.conn.execute(
+                    "UPDATE artifacts SET deleted_at = COALESCE(deleted_at, ?), updated_at = ? WHERE id = ?",
+                    (now, now, existing["id"]),
+                )
+                artifact_id = new_id("art")
+                self.conn.execute(
+                    "INSERT INTO artifacts (id, experiment_id, run_id, job_id, type, uri, content_hash, created_at, "
+                    "updated_at, attrs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        artifact_id,
+                        experiment_id,
+                        run_id,
+                        job_id,
+                        artifact_type,
+                        uri,
+                        content_hash,
+                        now,
+                        now,
+                        attrs_json(attrs),
+                    ),
+                )
+            elif existing:
                 artifact_id = existing["id"]
                 self.conn.execute(
                     "UPDATE artifacts SET experiment_id = COALESCE(?, experiment_id), run_id = COALESCE(?, run_id), "
@@ -658,6 +789,21 @@ class Repository:
                     ),
                 )
         return self.get_artifact(artifact_id)
+
+    def refresh_local_artifact(self, artifact_ref: str, *, update_hash: bool = False) -> dict[str, Any]:
+        artifact = self.get_artifact(artifact_ref)
+        metadata = local_artifact_metadata(artifact["uri"], cwd=Path.cwd())
+        if metadata is None:
+            raise ValidationError(f"artifact URI is not a readable local file: {artifact['uri']}")
+        attrs = {**artifact["attrs"], **metadata}
+        content_hash = file_sha256(Path(metadata["fieldbook.local_path_at_capture"])) if update_hash else artifact["content_hash"]
+        now = utc_now()
+        with self.conn:
+            self.conn.execute(
+                "UPDATE artifacts SET content_hash = ?, attrs_json = ?, updated_at = ? WHERE id = ?",
+                (content_hash, attrs_json(attrs), now, artifact["id"]),
+            )
+        return self.get_artifact(artifact["id"])
 
     def list_artifacts(
         self,
@@ -883,6 +1029,7 @@ class Repository:
         source_artifact_ref: str | None,
     ) -> dict[str, Any]:
         run_id = self.get_run(run_ref)["id"]
+        self._validate_post_archive_write("run", run_id, errata=False, label="metric")
         source_job_id = self.get_job(source_job_ref)["id"] if source_job_ref else None
         source_artifact_id = self.get_artifact(source_artifact_ref)["id"] if source_artifact_ref else None
         with self.conn:
@@ -976,6 +1123,7 @@ class Repository:
         body_format: str,
         author: str | None,
         attrs: dict[str, Any],
+        errata: bool = False,
     ) -> dict[str, Any]:
         require_choice(entity_type, ENTITY_TYPES, "entity type")
         require_choice(note_type, NOTE_TYPES, "note type")
@@ -984,8 +1132,11 @@ class Repository:
         title = validate_note_title(title)
         body = validate_note_body(body)
         entity_id = self._resolve_entity_id(entity_type, entity_ref)
+        self._validate_post_archive_write(entity_type, entity_id, errata=errata, label="note")
         attrs = self._attrs_with_session(attrs)
         now = utc_now()
+        if errata:
+            attrs = self._errata_attrs(attrs, now=now)
         note_id = new_id("note")
         with self.conn:
             self.conn.execute(
@@ -1237,6 +1388,12 @@ class Repository:
             raise ValidationError(f"experiment is archived/deleted and cannot be mutated: {experiment['id']}")
         return experiment["id"]
 
+    def _experiment_id_for_artifact_target(self, ref: str, *, errata: bool) -> str:
+        experiment = self.get_experiment(ref)
+        if experiment["deleted_at"] is not None and not errata:
+            raise ValidationError(f"experiment is archived/deleted and requires --errata: {experiment['id']}")
+        return experiment["id"]
+
     def _active_entity_id(self, entity_type: str, ref: str) -> str:
         require_choice(entity_type, ENTITY_TYPES, "entity type")
         row = self._resolve_row(
@@ -1253,6 +1410,104 @@ class Repository:
         if "deleted_at" in row.keys() and row["deleted_at"] is not None:
             raise ValidationError(f"{entity_type} is archived/deleted and cannot be validated: {ref}")
         return str(row["id"])
+
+    def _validate_post_archive_write(self, entity_type: str, entity_id: str, *, errata: bool, label: str) -> None:
+        archived_experiment_ids = self._archived_experiment_ids_for_entity(entity_type, entity_id)
+        if archived_experiment_ids and not errata:
+            joined = ", ".join(sorted(archived_experiment_ids))
+            raise ValidationError(f"{label} targets archived experiment(s) and requires --errata: {joined}")
+
+    def _validate_artifact_targets_post_archive(
+        self,
+        *,
+        experiment_id: str | None,
+        run_id: str | None,
+        job_id: str | None,
+        errata: bool,
+    ) -> None:
+        archived_ids: set[str] = set()
+        if experiment_id:
+            archived_ids.update(self._archived_experiment_ids_for_entity("experiment", experiment_id))
+        if run_id:
+            archived_ids.update(self._archived_experiment_ids_for_entity("run", run_id))
+        if job_id:
+            archived_ids.update(self._archived_experiment_ids_for_entity("job", job_id))
+        if archived_ids and not errata:
+            joined = ", ".join(sorted(archived_ids))
+            raise ValidationError(f"artifact targets archived experiment(s) and requires --errata: {joined}")
+
+    def _archived_experiment_ids_for_entity(self, entity_type: str, entity_id: str) -> set[str]:
+        owner_ids = self._owner_experiment_ids_for_entity(entity_type, entity_id)
+        if not owner_ids:
+            return set()
+        placeholders = ", ".join("?" for _ in owner_ids)
+        rows = self.conn.execute(
+            f"SELECT id FROM experiments WHERE id IN ({placeholders}) AND deleted_at IS NOT NULL",
+            tuple(owner_ids),
+        ).fetchall()
+        return {str(row["id"]) for row in rows}
+
+    def _owner_experiment_ids_for_entity(self, entity_type: str, entity_id: str) -> set[str]:
+        require_choice(entity_type, ENTITY_TYPES, "entity type")
+        if entity_type == "experiment":
+            return {entity_id}
+        if entity_type == "run":
+            return {
+                str(row["experiment_id"])
+                for row in self.conn.execute(
+                    "SELECT experiment_id FROM experiment_runs WHERE run_id = ?",
+                    (entity_id,),
+                ).fetchall()
+            }
+        if entity_type == "job":
+            row = self.conn.execute("SELECT experiment_id, run_id FROM jobs WHERE id = ?", (entity_id,)).fetchone()
+            if row is None:
+                return set()
+            result = {str(row["experiment_id"])} if row["experiment_id"] else set()
+            if row["run_id"]:
+                result.update(self._owner_experiment_ids_for_entity("run", str(row["run_id"])))
+            return result
+        if entity_type == "artifact":
+            row = self.conn.execute("SELECT * FROM artifacts WHERE id = ?", (entity_id,)).fetchone()
+            return self._artifact_row_experiment_ids(row) if row else set()
+        if entity_type == "metric":
+            row = self.conn.execute("SELECT run_id FROM metrics WHERE id = ?", (entity_id,)).fetchone()
+            return self._owner_experiment_ids_for_entity("run", str(row["run_id"])) if row else set()
+        return set()
+
+    def _artifact_target_experiment_ids(
+        self,
+        *,
+        experiment_id: str | None,
+        run_id: str | None,
+        job_id: str | None,
+    ) -> set[str]:
+        result = {experiment_id} if experiment_id else set()
+        if run_id:
+            result.update(self._owner_experiment_ids_for_entity("run", run_id))
+        if job_id:
+            result.update(self._owner_experiment_ids_for_entity("job", job_id))
+        return result
+
+    def _artifact_row_experiment_ids(self, row: sqlite3.Row) -> set[str]:
+        result = {str(row["experiment_id"])} if row["experiment_id"] else set()
+        if row["run_id"]:
+            result.update(self._owner_experiment_ids_for_entity("run", str(row["run_id"])))
+        if row["job_id"]:
+            result.update(self._owner_experiment_ids_for_entity("job", str(row["job_id"])))
+        return result
+
+    def _errata_attrs(self, attrs: dict[str, Any], *, now: str, replaces: str | None = None) -> dict[str, Any]:
+        result = {
+            **attrs,
+            "fieldbook.erratum": True,
+            "fieldbook.erratum_at": now,
+        }
+        if self.current_session_id:
+            result["fieldbook.erratum_session_id"] = self.current_session_id
+        if replaces:
+            result["fieldbook.replaces"] = replaces
+        return result
 
     def _retry_of_id(self, *, job_id: str, retry_of_ref: str | None) -> str | None:
         if retry_of_ref is None:
@@ -1330,6 +1585,31 @@ class Repository:
         ]
         return "\n".join(lines).rstrip() + "\n"
 
+    def _checkpoint_body(self, *, body: str | None, freshness: dict[str, Any]) -> str:
+        lines: list[str] = []
+        if body:
+            lines.extend([body.rstrip(), ""])
+        else:
+            lines.extend(["# Experiment Checkpoint", ""])
+        lines.extend(
+            [
+                "## Freshness",
+                "",
+                f"- Checkpoint status: `{freshness['checkpoint_status']}`",
+                f"- Drifted artifacts: {freshness['drifted_artifact_count']}",
+                f"- Stale validations: {freshness['stale_validation_count']}",
+            ]
+        )
+        if freshness.get("drifted_artifacts"):
+            lines.extend(["", "### Drifted Artifacts"])
+            for artifact in freshness["drifted_artifacts"][:5]:
+                lines.append(f"- `{artifact['id']}` {artifact['uri']} ({artifact['drift_kind']})")
+        if freshness.get("stale_validations"):
+            lines.extend(["", "### Stale Validations"])
+            for validation in freshness["stale_validations"][:5]:
+                lines.append(f"- `{validation['id']}` {validation['check_name']}")
+        return "\n".join(lines).rstrip() + "\n"
+
     def _parent_run_id(self, ref: str | None) -> str | None:
         if ref is None:
             return None
@@ -1369,6 +1649,26 @@ class Repository:
         for row in rows:
             counts[row["note_type"]][row["status"]] = int(row["count"])
         return counts
+
+    def _experiment_errata_count(self, experiment_id: str) -> int:
+        return len(self._experiment_errata_rows(experiment_id, limit=1_000_000))
+
+    def _experiment_errata_rows(self, experiment_id: str, *, limit: int) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for row in self.conn.execute("SELECT * FROM notes WHERE deleted_at IS NULL ORDER BY updated_at DESC").fetchall():
+            attrs = load_attrs(row["attrs_json"])
+            if attrs.get("fieldbook.erratum") is True and experiment_id in self._owner_experiment_ids_for_entity(row["entity_type"], row["entity_id"]):
+                rows.append({"entity_type": "note", "entity_id": row["id"], "created_at": row["created_at"], "attrs": attrs})
+        for row in self.conn.execute("SELECT * FROM artifacts WHERE deleted_at IS NULL ORDER BY updated_at DESC").fetchall():
+            attrs = load_attrs(row["attrs_json"])
+            if attrs.get("fieldbook.erratum") is True and experiment_id in self._artifact_row_experiment_ids(row):
+                rows.append({"entity_type": "artifact", "entity_id": row["id"], "created_at": row["created_at"], "attrs": attrs})
+        for row in self.conn.execute("SELECT * FROM validations WHERE deleted_at IS NULL ORDER BY updated_at DESC").fetchall():
+            attrs = load_attrs(row["attrs_json"])
+            if attrs.get("fieldbook.erratum") is True and experiment_id in self._owner_experiment_ids_for_entity(row["entity_type"], row["entity_id"]):
+                rows.append({"entity_type": "validation", "entity_id": row["id"], "created_at": row["created_at"], "attrs": attrs})
+        rows.sort(key=lambda item: (item["created_at"], item["entity_id"]), reverse=True)
+        return rows[:limit]
 
     def _experiment_compact_notes(self, experiment_id: str) -> dict[str, list[dict[str, Any]]]:
         return {

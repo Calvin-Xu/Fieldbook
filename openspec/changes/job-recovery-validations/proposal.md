@@ -20,6 +20,14 @@ This phase intentionally stops before live refresh orchestration. It stores reco
 - Add doctor checks for stale submission attempts so agents are prompted to refresh or correct
   jobs whose submission outcome is still uncertain.
 
+## Behavior Change: Archived Experiments Require Explicit Errata
+
+Before this amendment, notes could be appended to archived experiments without a
+special marker. Fieldbook is still pre-v1, and this phase intentionally tightens
+that behavior: any post-archive evidence write to notes, artifacts, or
+validations must be explicit via `--errata` or row-level `_errata: true` in
+reconcile. Jobs and metrics remain closed after archive.
+
 ## Capabilities
 
 ### New Capabilities

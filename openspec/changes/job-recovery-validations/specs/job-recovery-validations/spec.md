@@ -176,3 +176,54 @@ The system SHALL support validation report artifacts as linked evidence.
 #### Scenario: Use validation report as evidence
 - **WHEN** a validation references a `validation-report` artifact
 - **THEN** the system stores the source artifact link like any other artifact link
+
+### Requirement: Allow explicit post-archive errata
+The system SHALL permit narrowly scoped post-archive corrections without reopening an experiment.
+
+#### Scenario: Reject normal archived note write
+- **WHEN** an agent adds a note to an archived experiment without `--errata`
+- **THEN** the system rejects the write with a validation error
+
+#### Scenario: Accept archived erratum note
+- **WHEN** an agent adds a note to an archived experiment with `--errata`
+- **THEN** the system inserts the note and stamps attrs `fieldbook.erratum=true`, `fieldbook.erratum_at`, and `fieldbook.erratum_session_id` when a valid session is current
+
+#### Scenario: Accept archived erratum artifact
+- **WHEN** an agent adds an artifact to an archived experiment with `--errata`
+- **THEN** the system inserts the artifact and stamps attrs `fieldbook.erratum=true`, `fieldbook.erratum_at`, and `fieldbook.erratum_session_id` when a valid session is current
+
+#### Scenario: Accept archived erratum validation
+- **WHEN** an agent adds a validation to an archived experiment with `--errata`
+- **THEN** the system inserts the validation and stamps attrs `fieldbook.erratum=true`, `fieldbook.erratum_at`, and `fieldbook.erratum_session_id` when a valid session is current
+
+#### Scenario: Replace artifact by erratum
+- **WHEN** an erratum artifact uses a URI that matches any active artifact
+- **THEN** the system archives the old artifact, inserts a new artifact, and records the old artifact ID in `attrs.fieldbook.replaces`
+
+#### Scenario: Replace validation by erratum
+- **WHEN** an erratum validation matches an active validation by entity type, entity ID, and check name
+- **THEN** the system archives the old validation, inserts a new validation, and records the old validation ID in `attrs.fieldbook.replaces`
+
+#### Scenario: Reject unsupported errata entities
+- **WHEN** an agent attempts to write a job or metric with errata semantics
+- **THEN** the system rejects the write with a validation error
+
+#### Scenario: Require reconcile errata marker for archived targets
+- **WHEN** a reconcile manifest adds a note, artifact, or validation targeting an archived experiment
+- **THEN** the row must include `_errata: true`, or the manifest is rejected before commit
+
+#### Scenario: Require errata marker for transitive archived targets
+- **WHEN** a note, artifact, or validation targets a run, job, artifact, or validation owned by an archived experiment
+- **THEN** the write must use errata semantics, or the system rejects it with a validation error
+
+#### Scenario: Reject reconcile update against archived targets
+- **WHEN** a reconcile manifest updates a note, artifact, or validation owned by an archived experiment
+- **THEN** the manifest is rejected before commit, because errata are insert-only
+
+#### Scenario: Reject reconcile errata marker for jobs and metrics
+- **WHEN** a reconcile manifest includes `_errata: true` on a job or metric row
+- **THEN** the manifest is rejected before commit
+
+#### Scenario: Preserve archived experiment state
+- **WHEN** an erratum is added to an archived experiment
+- **THEN** the experiment remains archived and status/context surfaces show the erratum under bounded `historical.erratum_count` and recent errata rows

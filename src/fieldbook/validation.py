@@ -34,7 +34,7 @@ ARTIFACT_TYPES = {
     "manifest",
     "other",
 }
-NOTE_TYPES = {"research", "debug", "handoff", "next-action", "decision"}
+NOTE_TYPES = {"research", "debug", "handoff", "next-action", "decision", "checkpoint"}
 NOTE_STATUSES = {"open", "resolved", "superseded"}
 NOTE_BODY_FORMATS = {"markdown", "plain"}
 SYNC_EVENT_STATUSES = {"pending", "synced", "failed", "skipped"}

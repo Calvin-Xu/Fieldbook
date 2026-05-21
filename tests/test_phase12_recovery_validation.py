@@ -256,10 +256,6 @@ def test_validation_cli_idempotency_status_and_report_artifacts(tmp_path: Path) 
     shown = payload(run_fieldbook(ledger, "validation", "show", validation["id"]))
     assert shown["details"] == {"missing": []}
 
-    archived = payload(run_fieldbook(ledger, "validation", "archive", validation["id"]))
-    assert archived["deleted_at"] is not None
-    assert payload(run_fieldbook(ledger, "validation", "list", "--entity-type", "experiment", "--entity-id", experiment_id)) == []
-
     invalid = run_fieldbook(
         ledger,
         "validation",
@@ -295,6 +291,334 @@ def test_validation_cli_idempotency_status_and_report_artifacts(tmp_path: Path) 
     )
     status = payload(run_fieldbook(ledger, "experiment", "status", experiment_id))
     assert [row["id"] for row in status["validations"]["unknown_blocking"]] == [unknown_blocking["id"]]
+
+    archived = payload(run_fieldbook(ledger, "validation", "archive", validation["id"]))
+    assert archived["deleted_at"] is not None
+
+
+def test_archived_experiment_errata_notes_artifacts_and_validations(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    experiment_id = create_experiment(ledger)
+    run_id = create_run(ledger, experiment_id)
+    artifact = payload(
+        run_fieldbook(
+            ledger,
+            "artifact",
+            "add",
+            "--experiment",
+            experiment_id,
+            "--type",
+            "report",
+            "--uri",
+            str(tmp_path / "report.md"),
+        )
+    )
+    validation = payload(
+        run_fieldbook(
+            ledger,
+            "validation",
+            "add",
+            "--entity-type",
+            "experiment",
+            "--entity-id",
+            experiment_id,
+            "--check-name",
+            "matrix.coverage.rollup",
+            "--status",
+            "pass",
+        )
+    )
+    payload(run_fieldbook(ledger, "experiment", "archive", experiment_id))
+
+    normal_note = run_fieldbook(
+        ledger,
+        "note",
+        "add",
+        "--entity-type",
+        "experiment",
+        "--entity-id",
+        experiment_id,
+        "--type",
+        "research",
+        "--body",
+        "late note without errata",
+        check=False,
+    )
+    assert normal_note.returncode == ExitCode.VALIDATION_ERROR
+    assert "errata" in normal_note.stderr
+
+    erratum_note = payload(
+        run_fieldbook(
+            ledger,
+            "note",
+            "add",
+            "--entity-type",
+            "run",
+            "--entity-id",
+            run_id,
+            "--type",
+            "research",
+            "--body",
+            "post-archive correction",
+            "--errata",
+        )
+    )
+    assert erratum_note["attrs"]["fieldbook.erratum"] is True
+    assert "fieldbook.erratum_at" in erratum_note["attrs"]
+
+    normal_artifact = run_fieldbook(
+        ledger,
+        "artifact",
+        "add",
+        "--experiment",
+        experiment_id,
+        "--type",
+        "report",
+        "--uri",
+        str(tmp_path / "new-report.md"),
+        check=False,
+    )
+    assert normal_artifact.returncode == ExitCode.VALIDATION_ERROR
+
+    replacement_artifact = payload(
+        run_fieldbook(
+            ledger,
+            "artifact",
+            "add",
+            "--experiment",
+            experiment_id,
+            "--type",
+            "report",
+            "--uri",
+            artifact["uri"],
+            "--errata",
+        )
+    )
+    assert replacement_artifact["id"] != artifact["id"]
+    assert replacement_artifact["attrs"]["fieldbook.replaces"] == artifact["id"]
+    assert replacement_artifact["attrs"]["fieldbook.erratum"] is True
+    assert payload(run_fieldbook(ledger, "artifact", "show", artifact["id"]))["deleted_at"] is not None
+
+    normal_validation = run_fieldbook(
+        ledger,
+        "validation",
+        "add",
+        "--entity-type",
+        "experiment",
+        "--entity-id",
+        experiment_id,
+        "--check-name",
+        "matrix.coverage.rollup",
+        "--status",
+        "warning",
+        check=False,
+    )
+    assert normal_validation.returncode == ExitCode.VALIDATION_ERROR
+
+    replacement_validation = payload(
+        run_fieldbook(
+            ledger,
+            "validation",
+            "add",
+            "--entity-type",
+            "experiment",
+            "--entity-id",
+            experiment_id,
+            "--check-name",
+            "matrix.coverage.rollup",
+            "--status",
+            "warning",
+            "--errata",
+        )
+    )
+    assert replacement_validation["id"] != validation["id"]
+    assert replacement_validation["attrs"]["fieldbook.replaces"] == validation["id"]
+    assert replacement_validation["attrs"]["fieldbook.erratum"] is True
+    assert payload(run_fieldbook(ledger, "validation", "show", validation["id"]))["deleted_at"] is not None
+
+    status = payload(run_fieldbook(ledger, "experiment", "status", experiment_id))
+    assert status["experiment"]["deleted_at"] is not None
+    assert status["historical"]["erratum_count"] == 3
+    assert {row["entity_type"] for row in status["historical"]["recent_errata"]} == {"artifact", "note", "validation"}
+
+
+def test_reconcile_errata_required_for_archived_targets(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    experiment_id = create_experiment(ledger)
+    artifact = payload(
+        run_fieldbook(
+            ledger,
+            "artifact",
+            "add",
+            "--experiment",
+            experiment_id,
+            "--type",
+            "report",
+            "--uri",
+            str(tmp_path / "coverage.md"),
+        )
+    )
+    validation = payload(
+        run_fieldbook(
+            ledger,
+            "validation",
+            "add",
+            "--entity-type",
+            "experiment",
+            "--entity-id",
+            experiment_id,
+            "--check-name",
+            "matrix.coverage.rollup",
+            "--status",
+            "pass",
+        )
+    )
+    session_id = payload(run_fieldbook(ledger, "session", "start", "--experiment", experiment_id))["session"]["id"]
+    payload(run_fieldbook(ledger, "experiment", "archive", experiment_id))
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "notes": [
+                    {
+                        "entity_type": "experiment",
+                        "entity_id": experiment_id,
+                        "note_type": "research",
+                        "body": "late note",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rejected = run_fieldbook(ledger, "reconcile", "file", "--path", str(manifest), "--apply", check=False)
+    assert rejected.returncode == ExitCode.VALIDATION_ERROR
+    assert "_errata" in rejected.stderr
+
+    manifest.write_text(
+        json.dumps(
+            {
+                "notes": [
+                    {
+                        "entity_type": "experiment",
+                        "entity_id": experiment_id,
+                        "note_type": "research",
+                        "body": "late note",
+                        "_errata": True,
+                    }
+                ],
+                "metrics": [
+                    {
+                        "run_id": "run_missing",
+                        "metric_name": "eval/bpb",
+                        "value": 1.0,
+                        "_errata": True,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    metric_errata = run_fieldbook(ledger, "reconcile", "file", "--path", str(manifest), "--apply", check=False)
+    assert metric_errata.returncode == ExitCode.VALIDATION_ERROR
+    assert "_errata" in metric_errata.stderr
+
+    manifest.write_text(
+        json.dumps(
+            {
+                "notes": [
+                    {
+                        "entity_type": "experiment",
+                        "entity_id": experiment_id,
+                        "note_type": "research",
+                        "body": "late note",
+                        "_errata": True,
+                    }
+                ],
+                "artifacts": [
+                    {
+                        "experiment_id": experiment_id,
+                        "type": "report",
+                        "uri": artifact["uri"],
+                        "_errata": True,
+                    }
+                ],
+                "validations": [
+                    {
+                        "entity_type": "experiment",
+                        "entity_id": experiment_id,
+                        "check_name": "matrix.coverage.rollup",
+                        "status": "warning",
+                        "_errata": True,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    applied = payload(run_fieldbook(ledger, "reconcile", "file", "--path", str(manifest), "--apply"))
+    assert applied["counts"]["insert"]["notes"] == 1
+    assert applied["counts"]["insert"]["artifacts"] == 1
+    assert applied["counts"]["archive"]["artifacts"] == 1
+    assert applied["counts"]["insert"]["validations"] == 1
+    assert applied["counts"]["archive"]["validations"] == 1
+    note_id = payload(run_fieldbook(ledger, "note", "list", "--entity-type", "experiment", "--entity-id", experiment_id))[0]["id"]
+    note = payload(run_fieldbook(ledger, "note", "show", note_id))
+    assert note["attrs"]["fieldbook.erratum"] is True
+    assert note["attrs"]["fieldbook.erratum_session_id"] == session_id
+    replaced_artifact_id = payload(run_fieldbook(ledger, "artifact", "list", "--experiment", experiment_id))[0]["id"]
+    replaced_artifact = payload(run_fieldbook(ledger, "artifact", "show", replaced_artifact_id))
+    assert replaced_artifact["id"] != artifact["id"]
+    assert replaced_artifact["attrs"]["fieldbook.replaces"] == artifact["id"]
+    assert replaced_artifact["attrs"]["fieldbook.erratum_session_id"] == session_id
+    assert payload(run_fieldbook(ledger, "artifact", "show", artifact["id"]))["deleted_at"] is not None
+    replaced_validation = payload(run_fieldbook(ledger, "validation", "list", "--entity-type", "experiment", "--entity-id", experiment_id))[0]
+    assert replaced_validation["id"] != validation["id"]
+    assert replaced_validation["attrs"]["fieldbook.replaces"] == validation["id"]
+    assert replaced_validation["attrs"]["fieldbook.erratum_session_id"] == session_id
+
+
+def test_reconcile_artifact_errata_does_not_replace_other_experiment_uri(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    archived_experiment_id = create_experiment(ledger)
+    active_experiment_id = create_experiment(ledger)
+    artifact = payload(
+        run_fieldbook(
+            ledger,
+            "artifact",
+            "add",
+            "--experiment",
+            active_experiment_id,
+            "--type",
+            "report",
+            "--uri",
+            str(tmp_path / "shared.md"),
+        )
+    )
+    payload(run_fieldbook(ledger, "experiment", "archive", archived_experiment_id))
+
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "artifacts": [
+                    {
+                        "experiment_id": archived_experiment_id,
+                        "type": "report",
+                        "uri": artifact["uri"],
+                        "_errata": True,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_fieldbook(ledger, "reconcile", "file", "--path", str(manifest), "--apply", check=False)
+    assert result.returncode == ExitCode.VALIDATION_ERROR
+    assert "outside the errata target experiments" in result.stderr
+    assert payload(run_fieldbook(ledger, "artifact", "show", artifact["id"]))["deleted_at"] is None
 
 
 def test_reconcile_retry_lineage_and_validations_are_atomic(tmp_path: Path) -> None:

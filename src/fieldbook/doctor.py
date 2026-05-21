@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from fieldbook.db import CURRENT_SCHEMA_VERSION, schema_version
+from fieldbook.freshness import drifted_artifacts, experiment_freshness, stale_validations
 from fieldbook.time_utils import utc_now
 
 
@@ -243,9 +244,10 @@ def _check_attrs_json(conn: sqlite3.Connection, _options: DoctorOptions) -> list
 def _check_note_entity(conn: sqlite3.Connection, _options: DoctorOptions) -> list[DoctorIssue]:
     issues: list[DoctorIssue] = []
     rows = conn.execute(
-        "SELECT id, entity_type, entity_id FROM notes WHERE deleted_at IS NULL ORDER BY updated_at, id"
+        "SELECT id, entity_type, entity_id, attrs_json FROM notes WHERE deleted_at IS NULL ORDER BY updated_at, id"
     ).fetchall()
     for row in rows:
+        attrs = json.loads(row["attrs_json"])
         table = ENTITY_TABLES.get(row["entity_type"])
         if table is None:
             missing = True
@@ -254,6 +256,8 @@ def _check_note_entity(conn: sqlite3.Connection, _options: DoctorOptions) -> lis
             target = conn.execute(f"SELECT deleted_at FROM {table} WHERE id = ?", (row["entity_id"],)).fetchone()
             missing = target is None
             deleted = bool(target and target["deleted_at"] is not None)
+        if deleted and attrs.get("fieldbook.erratum") is True:
+            continue
         if missing or deleted:
             issues.append(
                 DoctorIssue(
@@ -681,6 +685,70 @@ def _check_validations(conn: sqlite3.Connection, _options: DoctorOptions) -> lis
     return issues
 
 
+def _check_artifact_local_drift(conn: sqlite3.Connection, options: DoctorOptions) -> list[DoctorIssue]:
+    issues: list[DoctorIssue] = []
+    for row in drifted_artifacts(conn, cwd=options.cwd, limit=1_000_000):
+        issues.append(
+            DoctorIssue(
+                code="artifact.local_drift",
+                severity="warning",
+                entity_type="artifact",
+                entity_id=row["id"],
+                message="local artifact metadata differs from captured metadata",
+                details=row,
+                suggested_next_action="Run `fieldbook artifact refresh-local` after deciding the drift is expected.",
+            )
+        )
+    return issues
+
+
+def _check_validation_source_drift(conn: sqlite3.Connection, options: DoctorOptions) -> list[DoctorIssue]:
+    issues: list[DoctorIssue] = []
+    for row in stale_validations(conn, cwd=options.cwd, limit=1_000_000):
+        issues.append(
+            DoctorIssue(
+                code="validation.source_drift",
+                severity="warning",
+                entity_type="validation",
+                entity_id=row["id"],
+                message="validation source artifact changed after validation",
+                details=row,
+                suggested_next_action="Rerun the validation or record a new validation erratum.",
+            )
+        )
+    return issues
+
+
+def _check_experiment_checkpoint_stale(conn: sqlite3.Connection, options: DoctorOptions) -> list[DoctorIssue]:
+    issues: list[DoctorIssue] = []
+    for row in conn.execute("SELECT id, name FROM experiments WHERE deleted_at IS NULL ORDER BY updated_at, id").fetchall():
+        freshness = experiment_freshness(
+            conn,
+            experiment_id=row["id"],
+            cwd=options.cwd,
+            stale_checkpoint_hours=options.stale_hours,
+        )
+        if freshness["checkpoint_status"] not in {"missing", "stale"}:
+            continue
+        issues.append(
+            DoctorIssue(
+                code="experiment.checkpoint_stale",
+                severity="warning",
+                entity_type="experiment",
+                entity_id=row["id"],
+                message="experiment has activity without a current checkpoint",
+                details={
+                    "name": row["name"],
+                    "checkpoint_status": freshness["checkpoint_status"],
+                    "last_checkpoint_at": freshness["last_checkpoint_at"],
+                    "since_last_checkpoint_hours": freshness["since_last_checkpoint_hours"],
+                },
+                suggested_next_action="Run `fieldbook experiment checkpoint` before context switching or archiving.",
+            )
+        )
+    return issues
+
+
 def _check_secret_patterns(conn: sqlite3.Connection, _options: DoctorOptions) -> list[DoctorIssue]:
     issues: list[DoctorIssue] = []
     scans = [
@@ -1036,5 +1104,26 @@ DOCTOR_CHECKS: dict[str, DoctorCheck] = {
         default_enabled=True,
         severity="warning",
         runner=_check_refresh_events,
+    ),
+    "artifact.local_drift": DoctorCheck(
+        id="artifact.local_drift",
+        description="Detect local artifact files whose captured metadata drifted.",
+        default_enabled=True,
+        severity="warning",
+        runner=_check_artifact_local_drift,
+    ),
+    "validation.source_drift": DoctorCheck(
+        id="validation.source_drift",
+        description="Detect validations whose source artifacts changed.",
+        default_enabled=True,
+        severity="warning",
+        runner=_check_validation_source_drift,
+    ),
+    "experiment.checkpoint_stale": DoctorCheck(
+        id="experiment.checkpoint_stale",
+        description="Detect active experiments without a current checkpoint.",
+        default_enabled=True,
+        severity="warning",
+        runner=_check_experiment_checkpoint_stale,
     ),
 }

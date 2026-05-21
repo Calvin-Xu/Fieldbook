@@ -472,6 +472,16 @@ def _experiment_archive(args: argparse.Namespace, repo: Repository) -> dict[str,
     return repo.archive_experiment(args.experiment)
 
 
+def _experiment_checkpoint(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.checkpoint_experiment(
+        args.experiment,
+        body=_resolve_optional_body(args),
+        archive=args.archive,
+        errata=args.errata,
+        stale_hours=args.stale_hours,
+    )
+
+
 def _run_add(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
     return repo.add_run(
         name=args.name,
@@ -566,6 +576,7 @@ def _artifact_add(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
         content_hash=args.content_hash,
         attrs=parse_attrs(args.attr),
         update_existing=args.update_existing,
+        errata=args.errata,
     )
 
 
@@ -588,6 +599,10 @@ def _artifact_archive(args: argparse.Namespace, repo: Repository) -> dict[str, A
     return repo.archive_artifact(args.artifact)
 
 
+def _artifact_refresh_local(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.refresh_local_artifact(args.artifact, update_hash=args.update_hash)
+
+
 def _validation_add(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
     return repo.add_validation(
         entity_type=args.entity_type,
@@ -600,6 +615,7 @@ def _validation_add(args: argparse.Namespace, repo: Repository) -> dict[str, Any
         source_artifact_ref=args.source_artifact,
         source_job_ref=args.source_job,
         attrs=parse_attrs(args.attr),
+        errata=args.errata,
     )
 
 
@@ -661,6 +677,7 @@ def _note_add(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
         body_format=args.body_format,
         author=args.author,
         attrs=parse_attrs(args.attr),
+        errata=args.errata,
     )
 
 
@@ -955,6 +972,14 @@ def _parse_json_object(value: str | None, label: str) -> dict[str, Any]:
 
 
 def _resolve_note_body(args: argparse.Namespace) -> str:
+    if args.body_file is not None:
+        return Path(args.body_file).read_text()
+    if args.body_stdin:
+        return sys.stdin.read()
+    return args.body
+
+
+def _resolve_optional_body(args: argparse.Namespace) -> str | None:
     if args.body_file is not None:
         return Path(args.body_file).read_text()
     if args.body_stdin:
@@ -1294,6 +1319,18 @@ def _add_experiment_parsers(subparsers: argparse._SubParsersAction) -> None:
     archive.add_argument("experiment")
     archive.set_defaults(func=_repo_command(_experiment_archive))
 
+    checkpoint = commands.add_parser("checkpoint")
+    _common_repo_parser(checkpoint)
+    checkpoint.add_argument("experiment")
+    body_group = checkpoint.add_mutually_exclusive_group()
+    body_group.add_argument("--body")
+    body_group.add_argument("--body-file")
+    body_group.add_argument("--body-stdin", action="store_true")
+    checkpoint.add_argument("--archive", action="store_true")
+    checkpoint.add_argument("--errata", action="store_true")
+    checkpoint.add_argument("--stale-hours", type=float, default=24.0)
+    checkpoint.set_defaults(func=_repo_command(_experiment_checkpoint))
+
 
 def _add_run_parsers(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser("run", help="Manage runs")
@@ -1401,6 +1438,7 @@ def _add_artifact_parsers(subparsers: argparse._SubParsersAction) -> None:
     add.add_argument("--uri", required=True)
     add.add_argument("--content-hash")
     add.add_argument("--update-existing", action="store_true")
+    add.add_argument("--errata", action="store_true")
     _add_attr_option(add)
     add.set_defaults(func=_repo_command(_artifact_add))
 
@@ -1423,6 +1461,12 @@ def _add_artifact_parsers(subparsers: argparse._SubParsersAction) -> None:
     archive.add_argument("artifact")
     archive.set_defaults(func=_repo_command(_artifact_archive))
 
+    refresh_local = commands.add_parser("refresh-local")
+    _common_repo_parser(refresh_local)
+    refresh_local.add_argument("artifact")
+    refresh_local.add_argument("--update-hash", action="store_true")
+    refresh_local.set_defaults(func=_repo_command(_artifact_refresh_local))
+
 
 def _add_validation_parsers(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser("validation", help="Manage structured validation checks")
@@ -1439,6 +1483,7 @@ def _add_validation_parsers(subparsers: argparse._SubParsersAction) -> None:
     add.add_argument("--details-json")
     add.add_argument("--source-artifact")
     add.add_argument("--source-job")
+    add.add_argument("--errata", action="store_true")
     _add_attr_option(add)
     add.set_defaults(func=_repo_command(_validation_add))
 
@@ -1511,6 +1556,7 @@ def _add_note_parsers(subparsers: argparse._SubParsersAction) -> None:
     body_group.add_argument("--body-stdin", action="store_true")
     add.add_argument("--body-format", default="markdown", choices=sorted(NOTE_BODY_FORMATS))
     add.add_argument("--author")
+    add.add_argument("--errata", action="store_true")
     _add_attr_option(add)
     add.set_defaults(func=_repo_command(_note_add))
 

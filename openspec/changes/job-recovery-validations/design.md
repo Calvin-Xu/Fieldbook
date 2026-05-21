@@ -28,6 +28,35 @@ Dogfooding also exposed a second gap: an agent can attempt an external submissio
 
 ## Decisions
 
+### Decision: Errata are explicit post-archive evidence
+
+Archived experiments are historically closed. Fieldbook allows only notes,
+artifacts, and validations to be appended after archive, and only when the agent
+marks the write as errata. This is a pre-v1 tightening: unrestricted note writes
+to archived experiments are no longer allowed.
+
+Errata semantics apply transitively. A note on a run, an artifact on a run, or a
+validation on a job is considered post-archive when the owning experiment is
+archived. Those writes require `--errata` in CLI commands or `_errata: true` in
+reconcile.
+
+Errata writes are insert-only. If an erratum artifact has the same URI as any
+active artifact, Fieldbook archives the old artifact and inserts a new artifact
+with `attrs.fieldbook.replaces=<old_id>`. If an erratum validation has the same
+entity/check key as any active validation, Fieldbook archives the old validation
+and inserts a replacement with `attrs.fieldbook.replaces=<old_id>`. Existing
+notes, artifacts, validations, jobs, and metrics are not updated in place after
+archive. Reconcile update operations that target rows owned by archived
+experiments are rejected.
+
+`--errata` is also accepted for active experiments when an agent wants to mark a
+correction explicitly. The same insert-only replacement behavior applies to
+artifacts and validations.
+
+System-managed attrs use the reserved `fieldbook.*` namespace and are stamped
+internally after user attrs are validated. Agents still cannot set
+`fieldbook.*` keys through CLI `--attr` or reconcile attrs.
+
 ### Decision: Use `jobs.retry_of` for recovery lineage
 
 Add nullable `jobs.retry_of` referencing `jobs.id`. This is sufficient for the common "retry failed child under a fresh prefix" workflow and avoids a generic relation table before Fieldbook needs one.
@@ -89,6 +118,21 @@ Existing `failed_jobs` output remains available as historical context until v1, 
 - `historical.failed_jobs`
 
 Text output prints blocking failures first, submission uncertainty and in-progress recoveries as active work, recovered failures in a compact collapsed section, and full details only in JSON or drilldown commands.
+
+Post-archive errata are exposed under a bounded `historical` section:
+
+```json
+{
+  "historical": {
+    "erratum_count": 2,
+    "recent_errata": [
+      {"entity_type": "note", "entity_id": "note_...", "created_at": "..."}
+    ]
+  }
+}
+```
+
+The presence of errata never reactivates an archived experiment.
 
 ### Decision: Store validations in a dedicated table
 

@@ -55,3 +55,10 @@ Do not begin implementation tasks until Phase 12 is implemented and 1.6 is compl
 - [x] 6.2 Run CC implementation review with `env -u ANTHROPIC_API_KEY claude --resume 23592491-85d8-4d6e-9cd3-3dbe7f265110 --model claude-opus-4-7 --effort max`.
 - [x] 6.3 Patch CC blockers and rerun validation.
 - [x] 6.4 Commit and push the implementation.
+
+## 7. Phase 14 Freshness Integration
+
+- [x] 7.0 Defer this amendment implementation until Phase 14 freshness helpers are implemented.
+- [x] 7.1 Add failing tests that refresh output includes bounded `drifted_artifacts` when local artifacts in scope drift.
+- [x] 7.2 Reuse Phase 14 drift helpers in refresh output without adding polling or implicit refresh behavior.
+- [x] 7.3 Validate OpenSpec, run tests and py_compile, run CC implementation review, patch blockers, and rerun validation.

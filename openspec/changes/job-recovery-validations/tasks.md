@@ -56,3 +56,14 @@ Do not begin implementation tasks until 1.6 is complete.
 - [x] 6.2 Run CC implementation review with `env -u ANTHROPIC_API_KEY claude --resume 23592491-85d8-4d6e-9cd3-3dbe7f265110 --model claude-opus-4-7 --effort max`.
 - [x] 6.3 Patch CC blockers and rerun validation.
 - [x] 6.4 Commit and push the implementation.
+
+## 7. Archived Errata Amendment
+
+- [x] 7.1 Add failing tests for archived experiment errata notes, artifacts, and validations.
+- [x] 7.2 Add failing tests that normal archived note/artifact/validation writes reject, including transitive archived run/job/artifact targets, and that jobs/metrics reject errata.
+- [x] 7.3 Add failing tests for global artifact-URI errata replacement, validation-key errata replacement, and repeated errata replacement chains.
+- [x] 7.4 Add failing tests for reconcile `_errata` handling on archived notes/artifacts/validations, rejection on jobs/metrics, and rejection of archived-target update operations.
+- [x] 7.5 Add `--errata` to `note add`, `artifact add`, and `validation add`.
+- [x] 7.6 Stamp `fieldbook.erratum`, `fieldbook.erratum_at`, optional `fieldbook.erratum_session_id`, and optional `fieldbook.replaces` attrs on errata rows.
+- [x] 7.7 Update status/context/show/list surfaces with bounded `historical.erratum_count` and recent errata rows without reactivating archived experiments.
+- [x] 7.8 Validate OpenSpec, run tests and py_compile, run CC implementation review, patch blockers, and rerun validation.

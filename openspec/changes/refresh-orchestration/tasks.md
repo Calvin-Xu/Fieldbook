@@ -5,7 +5,7 @@
 - [x] 1.3 Validate `refresh-orchestration`.
 - [x] 1.4 Run CC spec review with `env -u ANTHROPIC_API_KEY claude --resume 23592491-85d8-4d6e-9cd3-3dbe7f265110 --model claude-opus-4-7 --effort max`.
 - [x] 1.5 Patch spec blockers and revalidate.
-- [ ] 1.6 Commit and push the reviewed spec if it changed.
+- [x] 1.6 Commit and push the reviewed spec if it changed.
 
 Do not begin implementation tasks until Phase 12 is implemented and 1.6 is complete.
 

@@ -21,6 +21,9 @@ or export collaborator-ready data.
   --json` to confirm ledger locality and identity.
 - Use advisory sessions for agent context switching. They are provenance and
   handoff records, not locks.
+- Treat `run` rows as planned experiment datapoints. Before launching a matrix
+  job, create one run per intended result row and link launcher jobs to those
+  runs with `run link-job`.
 - Record live submissions before invoking external launchers. Use
   `submitting` while the launcher is in-flight and `unknown_submit` if the
   launcher exits without a reliable external acknowledgment.
@@ -164,12 +167,18 @@ uv run fieldbook experiment create \
   --json
 ```
 
-Record a run and job:
+Record planned runs and jobs:
 
 ```bash
-uv run fieldbook run add --experiment "$EXP_ID" --name "$RUN_NAME" --json
+RUN_ID=$(uv run fieldbook run add \
+  --experiment "$EXP_ID" \
+  --name "$RUN_NAME" \
+  --kind datapoint \
+  --idempotency-key "$EXPERIMENT_SLUG.$RUN_NAME" \
+  --json | jq -r .id)
 uv run fieldbook run add --experiment "$EXP_ID" --name "$DERIVED_RUN" --parent-run "$RUN_ID" --json
-uv run fieldbook job add --run "$RUN_ID" --status running --launcher iris --external-system iris --external-id "$JOB_PATH" --json
+JOB_ID=$(uv run fieldbook job add --run "$RUN_ID" --status running --launcher iris --external-system iris --external-id "$JOB_PATH" --json | jq -r .id)
+uv run fieldbook run link-job --run "$RUN_ID" --job "$JOB_ID" --role train --status running --json
 ```
 
 Record jobs before launching when possible. Use `submitting` while the external
@@ -196,12 +205,16 @@ The launch protocol is:
 
 1. Run `fieldbook db where --json`.
 2. Start or switch a session for the active experiment.
-3. Add the job with `--status submitting` and the exact launcher command before
+3. Add one run per intended result row. Use stable `--idempotency-key` values
+   so rerunning the planner returns the same datapoints.
+4. Add the job with `--status submitting` and the exact launcher command before
    invoking the external launcher.
-4. Run the external launcher.
-5. Update the job to an acknowledged state with the external identifier, or to
+5. Run the external launcher.
+6. Link the job to each affected run with `run link-job`, using `role=train`,
+   `role=eval`, or another explicit role and the best-known per-run status.
+7. Update the job to an acknowledged state with the external identifier, or to
    `unknown_submit` / `failed` when the outcome is ambiguous or rejected.
-6. Later, run `fieldbook refresh run --source <name> --apply` to reconcile
+8. Later, run `fieldbook refresh run --source <name> --apply` to reconcile
    external state and validations.
 
 When retrying a failed job, link lineage so recovered failures stop appearing as
@@ -391,6 +404,8 @@ uv run fieldbook doctor --list-checks --json
 uv run fieldbook doctor --check stale-jobs --stale-hours 12 --json
 uv run fieldbook doctor --check stale-sessions --stale-session-hours 24 --json
 uv run fieldbook doctor --check job-recovery --stale-unknown-submit-hours 6 --json
+uv run fieldbook doctor --check runs.expected_missing --json
+uv run fieldbook doctor --check job_runs.stale_state --json
 uv run fieldbook doctor --check validations --json
 uv run fieldbook doctor --check ledger-locality --locality-recent-days 7 --json
 ```
@@ -420,6 +435,7 @@ Use stable views for ad hoc analysis and dashboard prototypes:
 uv run fieldbook db where --json
 uv run fieldbook db path --json
 uv run fieldbook sql --query "SELECT * FROM v_experiment_summary_v1" --limit 100 --json
+uv run fieldbook sql --query "SELECT run_id, phase, has_checkpoint, metric_count FROM v_runs_progress_v1" --json
 uv run fieldbook sql --file /tmp/query.sql --format csv > /tmp/results.csv
 ```
 

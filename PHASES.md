@@ -20,7 +20,8 @@ files.
 | 12 | `job-recovery-validations` | `tests/test_phase12_recovery_validation.py` | Job retry/recovery lineage, submission-state lifecycle, blocker-aware status, and structured validation checks. |
 | 13 | `refresh-orchestration` | `tests/test_phase13_refresh_orchestration.py` | Explicit external refresh orchestration through snapshots, pure adapters, and reconcile. |
 | 14 | `experiment-freshness` | `tests/test_phase14_experiment_freshness.py` | Checkpoints, local artifact drift detection, stale validation detection, and status/context freshness summaries. |
-| 15 | `privacy-redaction` | `tests/test_phase15_privacy_redaction.py` | Placeholder: write-time privacy policy, redacted views, repair CLI, export preflight scans, and sanitized sharing surfaces. |
+| 15 | `runs-as-datapoints` | `tests/test_phase15_runs_as_datapoints.py` | First-class experiment matrix datapoints, job-run fan-out links, and run-progress reporting. |
+| 16 | `privacy-redaction` | `tests/test_phase16_privacy_redaction.py` | Placeholder: write-time privacy policy, redacted views, repair CLI, export preflight scans, and sanitized sharing surfaces. |
 
 ## Numbering Rules
 

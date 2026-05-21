@@ -13,11 +13,14 @@ from fieldbook.time_utils import utc_now
 from fieldbook.validation import (
     ARTIFACT_TYPES,
     ENTITY_TYPES,
+    JOB_RUN_ROLES,
+    JOB_RUN_STATUSES,
     JOB_STATUSES,
     NOTE_BODY_FORMATS,
     NOTE_STATUSES,
     NOTE_TYPES,
     RUN_STATUSES,
+    RUN_KINDS,
     SYNC_EVENT_STATUSES,
     VALIDATION_STATUSES,
     attrs_json,
@@ -25,6 +28,7 @@ from fieldbook.validation import (
     require_choice,
     validate_attrs_dict,
     validate_content_hash,
+    validate_idempotency_key,
     validate_metric_value,
     validate_note_body,
     validate_note_title,
@@ -32,17 +36,18 @@ from fieldbook.validation import (
 )
 
 
-ARCHIVABLE_ENTITIES = {"runs", "jobs", "artifacts", "metrics", "notes", "validations"}
+ARCHIVABLE_ENTITIES = {"runs", "jobs", "job_runs", "artifacts", "metrics", "notes", "validations"}
 UPSERT_ONLY_ENTITIES = {"custom_attributes"}
 ENTITY_ORDER = {
     "runs": 0,
     "jobs": 1,
-    "artifacts": 2,
-    "metrics": 3,
-    "notes": 4,
-    "validations": 5,
-    "custom_attributes": 6,
-    "sync_events": 7,
+    "job_runs": 2,
+    "artifacts": 3,
+    "metrics": 4,
+    "notes": 5,
+    "validations": 6,
+    "custom_attributes": 7,
+    "sync_events": 8,
 }
 ACTION_ORDER = {"insert": 0, "errata_replace": 1, "update": 2, "sync_event": 3, "noop": 4, "archive": 5}
 NOTE_AUDIT_PREVIEW_CHARS = 200
@@ -52,6 +57,8 @@ ENTITY_KEYS = {
     "runs": "runs",
     "job": "jobs",
     "jobs": "jobs",
+    "job_run": "job_runs",
+    "job_runs": "job_runs",
     "artifact": "artifacts",
     "artifacts": "artifacts",
     "metric": "metrics",
@@ -175,7 +182,17 @@ def reconcile_log(
 
 
 def _manifest_keys() -> list[str]:
-    return ["runs", "jobs", "artifacts", "metrics", "notes", "validations", "custom_attributes", "sync_events"]
+    return [
+        "runs",
+        "jobs",
+        "job_runs",
+        "artifacts",
+        "metrics",
+        "notes",
+        "validations",
+        "custom_attributes",
+        "sync_events",
+    ]
 
 
 def _as_list(value: Any, label: str) -> list[dict[str, Any]]:
@@ -223,6 +240,9 @@ def _plan(
         order += 1
     for job in normalized_manifest.get("jobs", []):
         operations.append(_plan_job(conn, job, experiment_id, order=order))
+        order += 1
+    for job_run in normalized_manifest.get("job_runs", []):
+        operations.append(_plan_job_run(conn, job_run, order=order))
         order += 1
     for artifact in normalized_manifest.get("artifacts", []):
         operations.append(_plan_artifact(conn, artifact, experiment_id, order=order, session_id=session_id))
@@ -349,7 +369,7 @@ def _row_errata(row: dict[str, Any], *, entity: str) -> bool:
     value = row.get("_errata", False)
     if value not in {True, False}:
         raise ValidationError("_errata must be true or false")
-    if value and entity in {"jobs", "metrics"}:
+    if value and entity in {"jobs", "job_runs", "metrics"}:
         raise ValidationError(f"{entity} do not support _errata")
     return bool(value)
 
@@ -361,14 +381,18 @@ def _clean_row(row: dict[str, Any]) -> dict[str, Any]:
 def _plan_run(conn: sqlite3.Connection, row: dict[str, Any], experiment_id: str | None, *, order: int) -> dict[str, Any]:
     op = _row_op(row, entity="runs")
     clean = _clean_row(row)
+    target_experiment_id = clean.get("experiment_id", experiment_id)
+    if target_experiment_id and "experiment_id" not in clean:
+        clean = {**clean, "experiment_id": target_experiment_id}
     existing = _find_entity(conn, "runs", clean)
     if op == "archive":
         return _archive_operation("runs", clean, existing, order=order)
     require_choice(clean.get("status", "active"), RUN_STATUSES, "run status")
+    require_choice(clean.get("kind", "datapoint"), RUN_KINDS, "run kind")
+    validate_idempotency_key(clean.get("idempotency_key"))
     run_id = existing["id"] if existing else clean.get("id", new_id("run"))
     parent_run_id = clean.get("parent_run_id")
     _validate_parent_run(conn, run_id, parent_run_id)
-    target_experiment_id = clean.get("experiment_id", experiment_id)
     _require_active_experiment(conn, target_experiment_id)
     if not existing and not clean.get("name"):
         raise ValidationError("run reconcile rows require name for inserts")
@@ -379,7 +403,18 @@ def _plan_run(conn: sqlite3.Connection, row: dict[str, Any], experiment_id: str 
         diff = _row_diff(
             existing,
             planned,
-            fields=["name", "description", "status", "external_system", "external_id", "parent_run_id", "attrs"],
+            fields=[
+                "experiment_id",
+                "name",
+                "description",
+                "status",
+                "kind",
+                "idempotency_key",
+                "external_system",
+                "external_id",
+                "parent_run_id",
+                "attrs",
+            ],
         )
         if target_experiment_id and not _run_link_exists(conn, target_experiment_id, run_id):
             diff["experiment_id"] = [None, target_experiment_id]
@@ -427,6 +462,51 @@ def _plan_job(conn: sqlite3.Connection, row: dict[str, Any], experiment_id: str 
         action = "update" if diff else "noop"
         return _operation(entity="jobs", action=action, entity_id=job_id, row=planned, order=order, existing=existing, diff=diff)
     return _operation(entity="jobs", action="insert", entity_id=job_id, row=planned, order=order)
+
+
+def _plan_job_run(conn: sqlite3.Connection, row: dict[str, Any], *, order: int) -> dict[str, Any]:
+    op = _row_op(row, entity="job_runs")
+    _row_errata(row, entity="job_runs")
+    clean = _clean_row(row)
+    existing = _find_entity(conn, "job_runs", clean)
+    if op == "archive":
+        return _archive_operation("job_runs", clean, existing, order=order)
+    if not clean.get("job_id") or not clean.get("run_id"):
+        raise ValidationError("job_run reconcile rows require job_id and run_id")
+    require_choice(clean.get("role", "other"), JOB_RUN_ROLES, "job-run role")
+    require_choice(clean.get("status", "planned"), JOB_RUN_STATUSES, "job-run status")
+    validate_utc_z(clean.get("started_at"), "started_at")
+    validate_utc_z(clean.get("finished_at"), "finished_at")
+    planned = {**clean, "role": clean.get("role", "other"), "status": clean.get("status", "planned")}
+    if existing:
+        if existing["role"] != planned["role"]:
+            raise ValidationError("job_run role is immutable for an existing job_id/run_id pair")
+        if "attrs" not in planned:
+            planned["attrs"] = load_attrs(existing["attrs_json"])
+        diff = _row_diff(
+            existing,
+            planned,
+            fields=["status", "started_at", "finished_at", "failure_reason", "attrs"],
+        )
+        if existing["deleted_at"] is not None:
+            diff["deleted_at"] = [existing["deleted_at"], None]
+        action = "update" if diff else "noop"
+        return _operation(
+            entity="job_runs",
+            action=action,
+            entity_id=f"{planned['job_id']}:{planned['run_id']}",
+            row=planned,
+            order=order,
+            existing=existing,
+            diff=diff,
+        )
+    return _operation(
+        entity="job_runs",
+        action="insert",
+        entity_id=f"{planned['job_id']}:{planned['run_id']}",
+        row=planned,
+        order=order,
+    )
 
 
 def _plan_artifact(
@@ -720,7 +800,9 @@ def _archive_operation(entity: str, row: dict[str, Any], existing: sqlite3.Row |
     if existing is None:
         raise NotFoundError(f"{entity} row not found for archive")
     action = "noop" if existing["deleted_at"] is not None else "archive"
-    return _operation(entity=entity, action=action, entity_id=existing["id"], row={**row, "id": existing["id"]}, order=order, existing=existing)
+    entity_id = f"{existing['job_id']}:{existing['run_id']}" if entity == "job_runs" else existing["id"]
+    planned = {**row, "id": entity_id} if entity != "job_runs" else {**row, "job_id": existing["job_id"], "run_id": existing["run_id"]}
+    return _operation(entity=entity, action=action, entity_id=entity_id, row=planned, order=order, existing=existing)
 
 
 def _find_entity(conn: sqlite3.Connection, table: str, row: dict[str, Any]) -> sqlite3.Row | None:
@@ -728,6 +810,16 @@ def _find_entity(conn: sqlite3.Connection, table: str, row: dict[str, Any]) -> s
         existing = conn.execute(f"SELECT * FROM {table} WHERE id = ?", (row["id"],)).fetchone()
         if existing:
             return existing
+    if table == "runs" and row.get("experiment_id") and row.get("idempotency_key"):
+        return conn.execute(
+            "SELECT * FROM runs WHERE experiment_id = ? AND idempotency_key = ? AND deleted_at IS NULL",
+            (row["experiment_id"], row["idempotency_key"]),
+        ).fetchone()
+    if table == "job_runs" and row.get("job_id") and row.get("run_id"):
+        return conn.execute(
+            "SELECT * FROM job_runs WHERE job_id = ? AND run_id = ?",
+            (row["job_id"], row["run_id"]),
+        ).fetchone()
     if table in {"runs", "jobs"} and row.get("external_system") and row.get("external_id"):
         return conn.execute(
             f"SELECT * FROM {table} WHERE external_system = ? AND external_id = ? AND deleted_at IS NULL",
@@ -972,6 +1064,8 @@ def _apply_plan(
             _apply_run(conn, operation)
         elif entity == "jobs":
             _apply_job(conn, operation)
+        elif entity == "job_runs":
+            _apply_job_run(conn, operation)
         elif operation["action"] == "errata_replace":
             _apply_errata_replace(conn, operation, session_id=session_id)
         elif entity == "artifacts":
@@ -993,13 +1087,17 @@ def _apply_run(conn: sqlite3.Connection, operation: dict[str, Any]) -> None:
     now = utc_now()
     if operation["action"] == "insert":
         conn.execute(
-            "INSERT INTO runs (id, name, description, status, external_system, external_id, parent_run_id, "
-            "created_at, updated_at, attrs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO runs (id, experiment_id, name, description, status, kind, idempotency_key, "
+            "external_system, external_id, parent_run_id, created_at, updated_at, attrs_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 row["id"],
+                row.get("experiment_id"),
                 row["name"],
                 row.get("description"),
                 row.get("status", "active"),
+                row.get("kind", "datapoint"),
+                row.get("idempotency_key"),
                 row.get("external_system"),
                 row.get("external_id"),
                 row.get("parent_run_id"),
@@ -1010,14 +1108,18 @@ def _apply_run(conn: sqlite3.Connection, operation: dict[str, Any]) -> None:
         )
     elif operation["action"] == "update":
         conn.execute(
-            "UPDATE runs SET name = COALESCE(?, name), description = COALESCE(?, description), "
-            "status = COALESCE(?, status), external_system = COALESCE(?, external_system), "
-            "external_id = COALESCE(?, external_id), parent_run_id = COALESCE(?, parent_run_id), "
-            "updated_at = ?, attrs_json = ? WHERE id = ?",
+            "UPDATE runs SET experiment_id = COALESCE(?, experiment_id), name = COALESCE(?, name), "
+            "description = COALESCE(?, description), status = COALESCE(?, status), "
+            "kind = COALESCE(?, kind), idempotency_key = COALESCE(?, idempotency_key), "
+            "external_system = COALESCE(?, external_system), external_id = COALESCE(?, external_id), "
+            "parent_run_id = COALESCE(?, parent_run_id), updated_at = ?, attrs_json = ? WHERE id = ?",
             (
+                row.get("experiment_id"),
                 row.get("name"),
                 row.get("description"),
                 row.get("status"),
+                row.get("kind"),
+                row.get("idempotency_key"),
                 row.get("external_system"),
                 row.get("external_id"),
                 row.get("parent_run_id"),
@@ -1085,6 +1187,44 @@ def _apply_job(conn: sqlite3.Connection, operation: dict[str, Any]) -> None:
                 attrs_json(row.get("attrs", {})),
                 now,
                 row["id"],
+            ),
+        )
+
+
+def _apply_job_run(conn: sqlite3.Connection, operation: dict[str, Any]) -> None:
+    row = operation["row"]
+    now = utc_now()
+    if operation["action"] == "insert":
+        conn.execute(
+            "INSERT INTO job_runs (job_id, run_id, role, status, started_at, finished_at, failure_reason, "
+            "created_at, updated_at, attrs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                row["job_id"],
+                row["run_id"],
+                row.get("role", "other"),
+                row.get("status", "planned"),
+                row.get("started_at"),
+                row.get("finished_at"),
+                row.get("failure_reason"),
+                now,
+                now,
+                attrs_json(row.get("attrs", {})),
+            ),
+        )
+    elif operation["action"] == "update":
+        conn.execute(
+            "UPDATE job_runs SET status = COALESCE(?, status), started_at = COALESCE(?, started_at), "
+            "finished_at = COALESCE(?, finished_at), failure_reason = COALESCE(?, failure_reason), "
+            "deleted_at = NULL, updated_at = ?, attrs_json = ? WHERE job_id = ? AND run_id = ?",
+            (
+                row.get("status"),
+                row.get("started_at"),
+                row.get("finished_at"),
+                row.get("failure_reason"),
+                now,
+                attrs_json(row.get("attrs", {})),
+                row["job_id"],
+                row["run_id"],
             ),
         )
 
@@ -1316,6 +1456,13 @@ def _apply_archive(conn: sqlite3.Connection, operation: dict[str, Any]) -> None:
         conn.execute(
             "UPDATE runs SET status = 'archived', deleted_at = COALESCE(deleted_at, ?), updated_at = ? WHERE id = ?",
             (now, now, operation["id"]),
+        )
+        return
+    if entity == "job_runs":
+        row = operation["row"]
+        conn.execute(
+            "UPDATE job_runs SET deleted_at = COALESCE(deleted_at, ?), updated_at = ? WHERE job_id = ? AND run_id = ?",
+            (now, now, row["job_id"], row["run_id"]),
         )
         return
     conn.execute(

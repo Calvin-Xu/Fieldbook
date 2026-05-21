@@ -12,7 +12,7 @@ from fieldbook.ledger_resolution import (
 )
 
 
-CURRENT_SCHEMA_VERSION = 11
+CURRENT_SCHEMA_VERSION = 12
 
 
 def resolve_init_path(

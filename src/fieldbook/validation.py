@@ -22,6 +22,9 @@ JOB_STATUSES = {
 }
 EXPERIMENT_STATUSES = {"active", "archived"}
 RUN_STATUSES = {"active", "archived"}
+RUN_KINDS = {"datapoint", "aggregate", "analysis", "external"}
+JOB_RUN_ROLES = {"train", "eval", "export", "analyze", "collect", "other"}
+JOB_RUN_STATUSES = JOB_STATUSES
 ARTIFACT_TYPES = {
     "checkpoint",
     "eval-result",

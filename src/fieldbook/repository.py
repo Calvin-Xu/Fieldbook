@@ -14,11 +14,14 @@ from fieldbook.validation import (
     ARTIFACT_TYPES,
     ENTITY_TYPES,
     EXPERIMENT_STATUSES,
+    JOB_RUN_ROLES,
+    JOB_RUN_STATUSES,
     JOB_STATUSES,
     NOTE_STATUSES,
     NOTE_BODY_FORMATS,
     NOTE_TYPES,
     RUN_STATUSES,
+    RUN_KINDS,
     VALIDATION_STATUSES,
     attrs_json,
     file_sha256,
@@ -210,9 +213,11 @@ class Repository:
         freshness = experiment_freshness(self.conn, experiment_id=experiment_id, cwd=Path.cwd(), stale_checkpoint_hours=stale_hours)
         active_job_count = sum(job_counts.get(status, 0) for status in ("submitting", "unknown_submit", "queued", "running"))
         has_active_blockers = bool(blocker_rows or validation_summary["failed"] or validation_summary["unknown_blocking"])
+        run_progress = self._experiment_run_progress(experiment_id, experiment_attrs=experiment["attrs"])
         return {
             "experiment": experiment,
             "run_count": run_count,
+            "runs": run_progress,
             "job_counts": job_counts,
             "ready": {
                 "is_ready": not has_active_blockers and active_job_count == 0,
@@ -317,6 +322,8 @@ class Repository:
         description: str | None,
         experiment_ref: str | None,
         status: str,
+        kind: str,
+        idempotency_key: str | None,
         external_system: str | None,
         external_id: str | None,
         parent_run_ref: str | None,
@@ -324,13 +331,25 @@ class Repository:
         update_existing: bool,
     ) -> dict[str, Any]:
         require_choice(status, RUN_STATUSES, "run status")
+        require_choice(kind, RUN_KINDS, "run kind")
+        idempotency_key = validate_idempotency_key(idempotency_key)
         existing = self._existing_external("runs", external_system, external_id)
         now = utc_now()
+        experiment_id = self._active_experiment_id(experiment_ref) if experiment_ref else None
+        if idempotency_key is not None and experiment_id is not None:
+            idempotent_existing = self.conn.execute(
+                "SELECT * FROM runs WHERE experiment_id = ? AND idempotency_key = ? AND deleted_at IS NULL "
+                "ORDER BY id LIMIT 1",
+                (experiment_id, idempotency_key),
+            ).fetchone()
+            if idempotent_existing is not None:
+                result = self._run_dict(idempotent_existing)
+                result["existed"] = True
+                return result
         if existing and not update_existing:
             raise AmbiguityError(
                 f"run external identifier {external_system}:{external_id} already exists as {existing['id']}"
             )
-        experiment_id = self._active_experiment_id(experiment_ref) if experiment_ref else None
         parent_run_id = self._parent_run_id(parent_run_ref)
         if existing and parent_run_id == existing["id"]:
             raise ValidationError("parent_run_id cannot reference the run itself")
@@ -338,20 +357,37 @@ class Repository:
             if existing:
                 run_id = existing["id"]
                 self.conn.execute(
-                    "UPDATE runs SET name = ?, description = ?, status = ?, "
+                    "UPDATE runs SET name = ?, description = ?, status = ?, kind = ?, "
+                    "experiment_id = COALESCE(?, experiment_id), idempotency_key = COALESCE(?, idempotency_key), "
                     "parent_run_id = COALESCE(?, parent_run_id), updated_at = ?, attrs_json = ? WHERE id = ?",
-                    (name, description, status, parent_run_id, now, attrs_json(attrs), run_id),
-                )
-            else:
-                run_id = new_id("run")
-                self.conn.execute(
-                    "INSERT INTO runs (id, name, description, status, external_system, external_id, parent_run_id, "
-                    "created_at, updated_at, attrs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
-                        run_id,
                         name,
                         description,
                         status,
+                        kind,
+                        experiment_id,
+                        idempotency_key,
+                        parent_run_id,
+                        now,
+                        attrs_json(attrs),
+                        run_id,
+                    ),
+                )
+                existed = True
+            else:
+                run_id = new_id("run")
+                self.conn.execute(
+                    "INSERT INTO runs (id, experiment_id, name, description, status, kind, idempotency_key, "
+                    "external_system, external_id, parent_run_id, created_at, updated_at, attrs_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        run_id,
+                        experiment_id,
+                        name,
+                        description,
+                        status,
+                        kind,
+                        idempotency_key,
                         external_system,
                         external_id,
                         parent_run_id,
@@ -360,9 +396,12 @@ class Repository:
                         attrs_json(attrs),
                     ),
                 )
+                existed = False
             if experiment_id:
                 self._link_run_ids(experiment_id, run_id)
-        return self.get_run(run_id)
+        result = self.get_run(run_id)
+        result["existed"] = existed
+        return result
 
     def list_runs(self, *, experiment_ref: str | None = None, include_archived: bool = False) -> list[dict[str, Any]]:
         params: list[Any] = [1 if include_archived else 0]
@@ -485,7 +524,60 @@ class Repository:
                         attrs_json(attrs),
                     ),
                 )
+            if run_id:
+                self._upsert_job_run(
+                    job_id=job_id,
+                    run_id=run_id,
+                    role="other",
+                    status=status,
+                    failure_reason=failure_reason,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    attrs={},
+                )
         return self.get_job(job_id)
+
+    def link_job_run(
+        self,
+        *,
+        job_ref: str,
+        run_ref: str,
+        role: str,
+        status: str,
+        failure_reason: str | None,
+        started_at: str | None = None,
+        finished_at: str | None = None,
+        attrs: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        job_id = self.get_job(job_ref)["id"]
+        run_id = self.get_run(run_ref)["id"]
+        require_choice(role, JOB_RUN_ROLES, "job-run role")
+        require_choice(status, JOB_RUN_STATUSES, "job-run status")
+        validate_utc_z(started_at, "started_at")
+        validate_utc_z(finished_at, "finished_at")
+        with self.conn:
+            self._upsert_job_run(
+                job_id=job_id,
+                run_id=run_id,
+                role=role,
+                status=status,
+                failure_reason=failure_reason,
+                started_at=started_at,
+                finished_at=finished_at,
+                attrs=attrs or {},
+            )
+        return self.get_job_run(job_ref=job_id, run_ref=run_id)
+
+    def get_job_run(self, *, job_ref: str, run_ref: str) -> dict[str, Any]:
+        job_id = self.get_job(job_ref)["id"]
+        run_id = self.get_run(run_ref)["id"]
+        row = self.conn.execute(
+            "SELECT * FROM job_runs WHERE job_id = ? AND run_id = ? AND deleted_at IS NULL",
+            (job_id, run_id),
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(f"job/run link not found: {job_id} -> {run_id}")
+        return self._job_run_dict(row)
 
     def link_job_retry(self, *, job_ref: str, retry_of_ref: str) -> dict[str, Any]:
         job = self.get_job(job_ref)
@@ -1739,6 +1831,43 @@ class Repository:
         params.append(limit)
         return self.conn.execute(query, params).fetchall()
 
+    def _experiment_run_progress(self, experiment_id: str, *, experiment_attrs: dict[str, Any]) -> dict[str, Any]:
+        rows = self.conn.execute(
+            "SELECT * FROM v_runs_progress_v1 WHERE experiment_id = ? ORDER BY name, run_id",
+            (experiment_id,),
+        ).fetchall()
+        by_kind = Counter(row["kind"] for row in rows)
+        by_phase = Counter(row["phase"] for row in rows)
+        metric_rows = self.conn.execute(
+            "SELECT m.metric_name, COUNT(DISTINCT m.run_id) AS run_count "
+            "FROM metrics m "
+            "JOIN runs r ON r.id = m.run_id "
+            "WHERE r.experiment_id = ? AND m.deleted_at IS NULL AND r.deleted_at IS NULL "
+            "GROUP BY m.metric_name ORDER BY m.metric_name",
+            (experiment_id,),
+        ).fetchall()
+        expected = experiment_attrs.get("progress.expected_runs")
+        expected_count = int(expected) if isinstance(expected, int | float) else None
+        missing_expected_count = max(expected_count - len(rows), 0) if expected_count is not None else None
+        return {
+            "total": len(rows),
+            "expected": expected_count,
+            "missing_expected_count": missing_expected_count,
+            "by_kind": dict(sorted(by_kind.items())),
+            "by_phase": dict(sorted(by_phase.items())),
+            "coverage": {
+                "has_checkpoint": sum(int(row["has_checkpoint"]) for row in rows),
+                "has_eval_result": sum(int(row["has_eval_result"]) for row in rows),
+                "by_metric": {row["metric_name"]: int(row["run_count"]) for row in metric_rows},
+            },
+            "failed_examples": [
+                self.get_run(row["run_id"])
+                for row in rows
+                if row["phase"] == "failed"
+            ][:10],
+            "missing_examples": [],
+        }
+
     def _upsert_metric(
         self,
         *,
@@ -1793,11 +1922,70 @@ class Repository:
             [(experiment_id, tag) for tag in tags],
         )
 
+    def _upsert_job_run(
+        self,
+        *,
+        job_id: str,
+        run_id: str,
+        role: str,
+        status: str,
+        failure_reason: str | None,
+        started_at: str | None,
+        finished_at: str | None,
+        attrs: dict[str, Any],
+    ) -> None:
+        require_choice(role, JOB_RUN_ROLES, "job-run role")
+        require_choice(status, JOB_RUN_STATUSES, "job-run status")
+        existing = self.conn.execute(
+            "SELECT * FROM job_runs WHERE job_id = ? AND run_id = ?",
+            (job_id, run_id),
+        ).fetchone()
+        now = utc_now()
+        if existing is not None:
+            if existing["role"] != role:
+                raise ValidationError("job/run link role is immutable; archive and create a new edge instead")
+            self.conn.execute(
+                "UPDATE job_runs SET status = ?, started_at = COALESCE(?, started_at), "
+                "finished_at = COALESCE(?, finished_at), failure_reason = COALESCE(?, failure_reason), "
+                "attrs_json = ?, deleted_at = NULL, updated_at = ? WHERE job_id = ? AND run_id = ?",
+                (
+                    status,
+                    started_at,
+                    finished_at,
+                    failure_reason,
+                    attrs_json(attrs),
+                    now,
+                    job_id,
+                    run_id,
+                ),
+            )
+            return
+        self.conn.execute(
+            "INSERT INTO job_runs (job_id, run_id, role, status, started_at, finished_at, failure_reason, "
+            "created_at, updated_at, attrs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                job_id,
+                run_id,
+                role,
+                status,
+                started_at,
+                finished_at,
+                failure_reason,
+                now,
+                now,
+                attrs_json(attrs),
+            ),
+        )
+
     def _link_run_ids(self, experiment_id: str, run_id: str) -> None:
         now = utc_now()
         self.conn.execute(
             "INSERT OR IGNORE INTO experiment_runs (experiment_id, run_id, created_at) VALUES (?, ?, ?)",
             (experiment_id, run_id, now),
+        )
+        self.conn.execute(
+            "UPDATE runs SET experiment_id = COALESCE(experiment_id, ?), updated_at = ? WHERE id = ?",
+            (experiment_id, now, run_id),
         )
 
     def _existing_external(
@@ -1905,6 +2093,11 @@ class Repository:
         data["attrs"] = load_attrs(data.pop("attrs_json", "{}"))
         if "code_dirty" in data:
             data["code_dirty"] = bool(data["code_dirty"])
+        return data
+
+    def _job_run_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        data = dict(row)
+        data["attrs"] = load_attrs(data.pop("attrs_json", "{}"))
         return data
 
     def _artifact_dict(self, row: sqlite3.Row) -> dict[str, Any]:

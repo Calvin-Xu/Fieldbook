@@ -13,6 +13,8 @@ from tests.test_phase2_cli import create_experiment, create_run, init_ledger, pa
 EXPECTED_VIEWS = {
     "v_experiments_v1",
     "v_runs_v1",
+    "v_job_runs_v1",
+    "v_runs_progress_v1",
     "v_jobs_v1",
     "v_artifacts_v1",
     "v_metrics_long_v1",
@@ -44,10 +46,14 @@ def test_stable_views_exist_and_filter_deleted_rows(tmp_path):
         assert conn.execute("SELECT COUNT(*) FROM v_runs_v1 WHERE run_id = ?", (run_id,)).fetchone()[0] == 0
         run_columns = [row["name"] for row in conn.execute("PRAGMA table_info(v_runs_v1)").fetchall()]
         assert run_columns == [
+            "id",
             "run_id",
+            "experiment_id",
             "name",
             "description",
             "status",
+            "kind",
+            "idempotency_key",
             "external_system",
             "external_id",
             "parent_run_id",

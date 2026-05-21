@@ -1013,6 +1013,114 @@ def _entity_type_for_table(table: str) -> str:
     return table
 
 
+def _check_expected_runs(conn: sqlite3.Connection, _options: DoctorOptions) -> list[DoctorIssue]:
+    issues: list[DoctorIssue] = []
+    rows = conn.execute(
+        "SELECT id, name, attrs_json FROM experiments WHERE deleted_at IS NULL ORDER BY updated_at DESC, id"
+    ).fetchall()
+    for row in rows:
+        attrs = json.loads(row["attrs_json"])
+        expected = attrs.get("progress.expected_runs")
+        if not isinstance(expected, int | float):
+            continue
+        actual = conn.execute(
+            "SELECT COUNT(*) FROM runs WHERE experiment_id = ? AND deleted_at IS NULL",
+            (row["id"],),
+        ).fetchone()[0]
+        missing = max(int(expected) - int(actual), 0)
+        if missing == 0:
+            continue
+        issues.append(
+            DoctorIssue(
+                code="runs.expected_missing",
+                severity="warning",
+                entity_type="experiment",
+                entity_id=row["id"],
+                message="experiment has fewer active runs than its progress.expected_runs target",
+                details={"expected_runs": int(expected), "actual_runs": int(actual), "missing_runs": missing},
+                suggested_next_action="Reconcile the launch manifest or correct progress.expected_runs.",
+            )
+        )
+    return issues
+
+
+def _check_unlinked_run_artifacts(conn: sqlite3.Connection, _options: DoctorOptions) -> list[DoctorIssue]:
+    rows = conn.execute(
+        "SELECT id, experiment_id, type, uri FROM artifacts WHERE deleted_at IS NULL "
+        "AND run_id IS NULL AND type IN ('checkpoint', 'eval-result') ORDER BY updated_at DESC, id"
+    ).fetchall()
+    return [
+        DoctorIssue(
+            code="artifact.unlinked_to_run",
+            severity="warning",
+            entity_type="artifact",
+            entity_id=row["id"],
+            message="run-scoped artifact type is not linked to a run",
+            details={"experiment_id": row["experiment_id"], "type": row["type"], "uri": row["uri"]},
+            suggested_next_action="Attach the artifact to its run or record it as a non-run artifact type.",
+        )
+        for row in rows
+    ]
+
+
+def _check_job_runs(conn: sqlite3.Connection, _options: DoctorOptions) -> list[DoctorIssue]:
+    issues: list[DoctorIssue] = []
+    stale_rows = conn.execute(
+        "SELECT jr.job_id, jr.run_id, jr.role, jr.status AS edge_status, j.status AS job_status "
+        "FROM job_runs jr JOIN jobs j ON j.id = jr.job_id JOIN runs r ON r.id = jr.run_id "
+        "WHERE jr.deleted_at IS NULL AND j.deleted_at IS NULL AND r.deleted_at IS NULL "
+        "AND jr.status IN ('planned', 'submitting', 'unknown_submit', 'queued', 'running', 'unknown') "
+        "AND j.status IN ('succeeded', 'failed', 'killed', 'skipped') "
+        "ORDER BY jr.updated_at DESC, jr.job_id, jr.run_id"
+    ).fetchall()
+    for row in stale_rows:
+        issues.append(
+            DoctorIssue(
+                code="job_runs.stale_state",
+                severity="warning",
+                entity_type="job_run",
+                entity_id=f"{row['job_id']}:{row['run_id']}",
+                message="job/run edge has active or unknown status while parent job is terminal",
+                details={
+                    "job_id": row["job_id"],
+                    "run_id": row["run_id"],
+                    "role": row["role"],
+                    "edge_status": row["edge_status"],
+                    "job_status": row["job_status"],
+                },
+                suggested_next_action="Refresh child-run state or update the job/run edge status.",
+            )
+        )
+    orphan_rows = conn.execute(
+        "SELECT jr.job_id, jr.run_id FROM job_runs jr "
+        "LEFT JOIN jobs j ON j.id = jr.job_id "
+        "LEFT JOIN runs r ON r.id = jr.run_id "
+        "WHERE jr.deleted_at IS NULL AND (j.id IS NULL OR r.id IS NULL OR j.deleted_at IS NOT NULL OR r.deleted_at IS NOT NULL) "
+        "ORDER BY jr.updated_at DESC, jr.job_id, jr.run_id"
+    ).fetchall()
+    for row in orphan_rows:
+        issues.append(
+            DoctorIssue(
+                code="job_runs.orphan",
+                severity="error",
+                entity_type="job_run",
+                entity_id=f"{row['job_id']}:{row['run_id']}",
+                message="job/run edge references a missing or archived job/run",
+                details={"job_id": row["job_id"], "run_id": row["run_id"]},
+                suggested_next_action="Archive the stale edge or restore the referenced entity.",
+            )
+        )
+    return issues
+
+
+def _check_job_run_stale_state(conn: sqlite3.Connection, options: DoctorOptions) -> list[DoctorIssue]:
+    return [issue for issue in _check_job_runs(conn, options) if issue.code == "job_runs.stale_state"]
+
+
+def _check_job_run_orphans(conn: sqlite3.Connection, options: DoctorOptions) -> list[DoctorIssue]:
+    return [issue for issue in _check_job_runs(conn, options) if issue.code == "job_runs.orphan"]
+
+
 DOCTOR_CHECKS: dict[str, DoctorCheck] = {
     "attrs-json": DoctorCheck(
         id="attrs-json",
@@ -1125,5 +1233,33 @@ DOCTOR_CHECKS: dict[str, DoctorCheck] = {
         default_enabled=True,
         severity="warning",
         runner=_check_experiment_checkpoint_stale,
+    ),
+    "runs.expected_missing": DoctorCheck(
+        id="runs.expected_missing",
+        description="Detect experiments with fewer recorded runs than progress.expected_runs.",
+        default_enabled=True,
+        severity="warning",
+        runner=_check_expected_runs,
+    ),
+    "artifact.unlinked_to_run": DoctorCheck(
+        id="artifact.unlinked_to_run",
+        description="Detect checkpoint/eval-result artifacts that are not linked to a run.",
+        default_enabled=True,
+        severity="warning",
+        runner=_check_unlinked_run_artifacts,
+    ),
+    "job_runs.stale_state": DoctorCheck(
+        id="job_runs.stale_state",
+        description="Detect job/run edges whose status is stale relative to the parent job.",
+        default_enabled=True,
+        severity="warning",
+        runner=_check_job_run_stale_state,
+    ),
+    "job_runs.orphan": DoctorCheck(
+        id="job_runs.orphan",
+        description="Detect job/run edges pointing at missing or archived entities.",
+        default_enabled=True,
+        severity="error",
+        runner=_check_job_run_orphans,
     ),
 }

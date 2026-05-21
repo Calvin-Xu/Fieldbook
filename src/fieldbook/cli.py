@@ -488,6 +488,8 @@ def _run_add(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
         description=args.description,
         experiment_ref=args.experiment,
         status=args.status,
+        kind=args.kind,
+        idempotency_key=args.idempotency_key,
         external_system=args.external_system,
         external_id=args.external_id,
         parent_run_ref=args.parent_run,
@@ -507,6 +509,19 @@ def _run_show(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
 
 def _run_link(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
     return repo.link_run(run_ref=args.run, experiment_ref=args.experiment)
+
+
+def _run_link_job(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.link_job_run(
+        run_ref=args.run,
+        job_ref=args.job,
+        role=args.role,
+        status=args.status,
+        failure_reason=args.failure_reason,
+        started_at=args.started_at,
+        finished_at=args.finished_at,
+        attrs=parse_attrs(args.attr),
+    )
 
 
 def _run_archive(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
@@ -1011,12 +1026,16 @@ def _format_experiment_context_markdown(context: dict[str, Any]) -> str:
         "",
         f"- Experiment ID: `{experiment['id']}`",
         f"- Status: `{experiment['status']}`",
-        f"- Runs: `{context['run_count']}`",
+        f"- Runs: `{context['runs']['total']}`",
         f"- Jobs: `{context['job_counts']}`",
         f"- Ready: `{context['ready']['is_ready']}`",
         f"- Active blockers: `{context['ready']['blocker_count']}`",
         f"- Active jobs: `{context['ready']['active_job_count']}`",
         f"- Submission uncertainty: `{context['ready']['submission_uncertainty_count']}`",
+        "",
+        "## Run Matrix",
+        "",
+        _format_run_progress(context["runs"]),
         "",
         "## Jobs",
         "",
@@ -1061,6 +1080,23 @@ def _format_job_list(title: str, jobs: list[dict[str, Any]]) -> str:
     lines = [f"### {title}", ""]
     for job in jobs:
         lines.append(f"- `{job['id']}` {job.get('name') or ''} status=`{job['status']}`")
+    return "\n".join(lines)
+
+
+def _format_run_progress(runs: dict[str, Any]) -> str:
+    lines = [
+        f"- Total: `{runs['total']}`",
+        f"- Expected: `{runs.get('expected')}`",
+        f"- Missing expected: `{runs.get('missing_expected_count')}`",
+        f"- By phase: `{runs.get('by_phase', {})}`",
+        f"- By kind: `{runs.get('by_kind', {})}`",
+        f"- Checkpoints: `{runs.get('coverage', {}).get('has_checkpoint', 0)}`",
+        f"- Eval artifacts: `{runs.get('coverage', {}).get('has_eval_result', 0)}`",
+        f"- Metric coverage: `{runs.get('coverage', {}).get('by_metric', {})}`",
+    ]
+    failed = runs.get("failed_examples", [])
+    if failed:
+        lines.append("- Failed examples: " + ", ".join(f"`{row['id']}` {row.get('name') or ''}" for row in failed[:10]))
     return "\n".join(lines)
 
 
@@ -1343,6 +1379,8 @@ def _add_run_parsers(subparsers: argparse._SubParsersAction) -> None:
     add.add_argument("--experiment")
     add.add_argument("--parent-run")
     add.add_argument("--status", default="active")
+    add.add_argument("--kind", default="datapoint")
+    add.add_argument("--idempotency-key")
     _add_external_options(add)
     _add_attr_option(add)
     add.set_defaults(func=_repo_command(_run_add))
@@ -1363,6 +1401,18 @@ def _add_run_parsers(subparsers: argparse._SubParsersAction) -> None:
     link.add_argument("run")
     link.add_argument("--experiment", required=True)
     link.set_defaults(func=_repo_command(_run_link))
+
+    link_job = commands.add_parser("link-job")
+    _common_repo_parser(link_job)
+    link_job.add_argument("--run", required=True)
+    link_job.add_argument("--job", required=True)
+    link_job.add_argument("--role", required=True)
+    link_job.add_argument("--status", required=True)
+    link_job.add_argument("--failure-reason")
+    link_job.add_argument("--started-at")
+    link_job.add_argument("--finished-at")
+    _add_attr_option(link_job)
+    link_job.set_defaults(func=_repo_command(_run_link_job))
 
     archive = commands.add_parser("archive")
     _common_repo_parser(archive)

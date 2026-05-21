@@ -68,9 +68,12 @@ An admin UI can come later if the CLI and schema prove useful.
 - **Experiment**: a research thread or question, such as "300M raw-PPL SNR" or
   "MoE mixture scaling ladder".
 - **Run**: a scientific datapoint, model, mixture, or configuration whose
-  provenance and metrics are tracked.
+  provenance and metrics are tracked. In launch-style experiments, create one
+  run per intended result row before submission so progress can be measured
+  against the expected matrix.
 - **Job**: an execution attempt that trains, evaluates, collects, exports, or
-  repairs one or more runs.
+  repairs one or more runs. Link fan-out jobs to datapoints with `job_runs`
+  edges (`run link-job`) rather than pretending one parent job is one run.
 - **Artifact**: a durable pointer to a checkpoint, result file, plot, CSV,
   report, W&B run, or debug log.
 - **Metric**: a summary observation tied to a run and usually backed by an
@@ -142,12 +145,14 @@ EXP_ID=$(uv run fieldbook experiment create \
   --json | python -c 'import json,sys; print(json.load(sys.stdin)["id"])')
 ```
 
-Record a run, a training job, an artifact, a metric, and a next action:
+Record planned datapoints first, then link jobs to the affected runs:
 
 ```bash
 RUN_ID=$(uv run fieldbook run add \
   --experiment "$EXP_ID" \
   --name run_00097 \
+  --kind datapoint \
+  --idempotency-key "300m-eval-proxy-sprint.run-00097" \
   --external-system wandb \
   --external-id example-wandb-run \
   --attr marin.mixture=proportional \
@@ -168,12 +173,19 @@ JOB_ID=$(uv run fieldbook job add \
   --external-id /user/example-train \
   --command "uv run train.py" \
   --json | python -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+uv run fieldbook run link-job \
+  --run "$RUN_ID" \
+  --job "$JOB_ID" \
+  --role train \
+  --status running \
+  --json
 ```
 
-For live submissions, record the job before invoking the external launcher when
-possible. Use `submitting` for an in-flight submitter and `unknown_submit` when
-the submitter times out before a reliable external acknowledgment. Link retries
-to the failed job they recover:
+For live submissions, record planned runs and jobs before invoking the external
+launcher when possible. Use `submitting` for an in-flight submitter and
+`unknown_submit` when the submitter times out before a reliable external
+acknowledgment. Link retries to the failed job they recover:
 
 ```bash
 SUBMIT_JOB_ID=$(uv run fieldbook job add \
@@ -252,7 +264,7 @@ uv run fieldbook experiment triage "$EXP_ID" --json
 
 `status` is the compact navigation surface for agents: counts, failed/stale
 jobs, retry/recovery readiness, validation summaries, key artifacts, freshness
-counts, and note previews. `context` is the LLM-ready Markdown
+counts, run-matrix progress, and note previews. `context` is the LLM-ready Markdown
 handoff surface with full bodies for active handoff, next-action, and debug
 notes plus recent research and decision notes.
 
@@ -399,11 +411,12 @@ uv run fieldbook reconcile file \
   --json
 ```
 
-Reconcile manifests default to upsert. Rows for runs, jobs, artifacts, metrics,
-and notes can set `_op: "archive"` to soft-archive an existing row. `_op:
-"delete"` is intentionally rejected. Manifests can also append external sync
-events, which is useful for recording follow-up W&B, Iris, or artifact refresh
-attempts without making those systems the ledger source of truth:
+Reconcile manifests default to upsert. Rows for runs, jobs, job-run edges,
+artifacts, metrics, and notes can set `_op: "archive"` to soft-archive an
+existing row. `_op: "delete"` is intentionally rejected. Manifests can also
+append external sync events, which is useful for recording follow-up W&B, Iris,
+or artifact refresh attempts without making those systems the ledger source of
+truth:
 
 ```json
 {
@@ -411,6 +424,14 @@ attempts without making those systems the ledger source of truth:
     {
       "id": "job_...",
       "_op": "archive"
+    }
+  ],
+  "job_runs": [
+    {
+      "job_id": "job_...",
+      "run_id": "run_...",
+      "role": "eval",
+      "status": "succeeded"
     }
   ],
   "sync_events": [
@@ -526,6 +547,8 @@ Audit the ledger before trusting a resumed experiment or export:
 uv run fieldbook doctor --json
 uv run fieldbook doctor --list-checks --json
 uv run fieldbook doctor --check stale-jobs --stale-hours 12 --json
+uv run fieldbook doctor --check runs.expected_missing --json
+uv run fieldbook doctor --check job_runs.stale_state --json
 ```
 
 `doctor` is read-only. It reports stable issue codes, severities, affected
@@ -557,7 +580,7 @@ Inspect the ledger through stable SQL views:
 uv run fieldbook db path --json
 
 uv run fieldbook sql \
-  --query "SELECT run_id, metric_name, value FROM v_metrics_long_v1 WHERE metric_name = 'eval/uncheatable_eval/bpb'" \
+  --query "SELECT run_id, phase, has_checkpoint, metric_count FROM v_runs_progress_v1" \
   --limit 100 \
   --json
 ```

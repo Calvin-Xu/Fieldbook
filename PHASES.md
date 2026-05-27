@@ -22,6 +22,9 @@ files.
 | 14 | `experiment-freshness` | `tests/test_phase14_experiment_freshness.py` | Checkpoints, local artifact drift detection, stale validation detection, and status/context freshness summaries. |
 | 15 | `runs-as-datapoints` | `tests/test_phase15_runs_as_datapoints.py` | First-class experiment matrix datapoints, job-run fan-out links, and run-progress reporting. |
 | 16 | `privacy-redaction` | `tests/test_phase16_privacy_redaction.py` | Placeholder: write-time privacy policy, redacted views, repair CLI, export preflight scans, and sanitized sharing surfaces. |
+| 17 | `active-experiment-workloop` | `tests/test_phase17_active_experiment_workloop.py` | Agent-facing active-experiment workloop, scoped health, and low-friction refresh/checkpoint discipline. |
+| 18 | `advisory-leases-and-monitors` | `tests/test_phase18_advisory_leases_monitors.py` | Advisory ownership leases for agent babysitting, monitor handoffs, and multi-agent coordination. |
+| 19 | `dashboard-mvp` | `tests/test_phase19_dashboard_mvp.py` | Read-only local dashboard over stable views for active experiment status and coordination state. |
 
 ## Numbering Rules
 

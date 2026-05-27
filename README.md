@@ -257,16 +257,21 @@ uv run fieldbook note add \
 Context-switch back to the experiment from any subdirectory:
 
 ```bash
+uv run fieldbook db where --json
+uv run fieldbook experiment workloop "$EXP_ID" --json
 uv run fieldbook experiment status "$EXP_ID" --json
 uv run fieldbook experiment context "$EXP_ID"
 uv run fieldbook experiment triage "$EXP_ID" --json
 ```
 
-`status` is the compact navigation surface for agents: counts, failed/stale
-jobs, retry/recovery readiness, validation summaries, key artifacts, freshness
-counts, run-matrix progress, and note previews. `context` is the LLM-ready Markdown
-handoff surface with full bodies for active handoff, next-action, and debug
-notes plus recent research and decision notes.
+`workloop` is the preferred one-command active-experiment resume surface for
+agents. It combines locality, session state, run/datapoint progress, jobs,
+validations, freshness, scoped doctor issues, and suggested next commands
+without refreshing, checkpointing, cleaning up, launching, or monitoring unless
+you pass explicit flags. `status` is the lower-level compact navigation surface
+for counts and previews. `context` is the LLM-ready Markdown handoff surface
+with full bodies for active handoff, next-action, and debug notes plus recent
+research and decision notes.
 
 Before writing to a ledger, inspect locality:
 
@@ -383,6 +388,8 @@ description = "Import a local metric CSV snapshot."
 EOF
 
 uv run fieldbook refresh list-sources --json
+uv run fieldbook experiment workloop "$EXP_ID" --refresh iris_jobs --json
+uv run fieldbook experiment workloop "$EXP_ID" --refresh iris_jobs --apply --json
 uv run fieldbook refresh run --source iris_jobs --experiment "$EXP_ID" --json
 uv run fieldbook refresh run --source iris_jobs --experiment "$EXP_ID" --apply --json
 uv run fieldbook refresh log --json

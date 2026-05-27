@@ -315,6 +315,53 @@ class Repository:
         status["freshness"] = freshness
         return status
 
+    def cleanup_experiment(self, ref: str, *, apply: bool) -> dict[str, Any]:
+        experiment = self.get_experiment(ref)
+        experiment_id = experiment["id"]
+        if apply and experiment["deleted_at"] is not None:
+            raise ValidationError("experiment cleanup requires an active experiment")
+        planned = self._experiment_cleanup_plan(experiment_id)
+        counts = {
+            "debug_notes_resolved": 0,
+            "validations_archived": 0,
+        }
+        checkpoint: dict[str, Any] | None = None
+        if apply:
+            now = utc_now()
+            with self.conn:
+                for note in planned["debug_notes"]:
+                    self.conn.execute(
+                        "UPDATE notes SET status = 'resolved', resolved_at = ?, updated_at = ? WHERE id = ?",
+                        (now, now, note["id"]),
+                    )
+                    counts["debug_notes_resolved"] += 1
+                for validation in planned["validations"]:
+                    self.conn.execute(
+                        "UPDATE validations SET deleted_at = COALESCE(deleted_at, ?), updated_at = ? WHERE id = ?",
+                        (now, now, validation["id"]),
+                    )
+                    counts["validations_archived"] += 1
+            if counts["debug_notes_resolved"] or counts["validations_archived"]:
+                checkpoint = self.add_note(
+                    entity_type="experiment",
+                    entity_ref=experiment_id,
+                    note_type="checkpoint",
+                    status="open",
+                    title="Experiment cleanup",
+                    body=self._cleanup_checkpoint_body(planned=planned, counts=counts),
+                    body_format="markdown",
+                    author=None,
+                    attrs={"fieldbook.cleanup": True},
+                    errata=False,
+                )
+        return {
+            "experiment": self.get_experiment(experiment_id),
+            "applied": apply,
+            "planned": planned,
+            "counts": counts,
+            "checkpoint": checkpoint,
+        }
+
     def add_run(
         self,
         *,
@@ -1867,6 +1914,62 @@ class Repository:
             ][:10],
             "missing_examples": [],
         }
+
+    def _experiment_cleanup_plan(self, experiment_id: str) -> dict[str, list[dict[str, Any]]]:
+        debug_notes = [
+            self._note_dict(row)
+            for row in self.conn.execute(
+                "SELECT n.* FROM notes n "
+                "JOIN v_jobs_with_recovery_v1 r ON r.job_id = n.entity_id "
+                "WHERE r.experiment_id = ? AND r.is_recovered_failed = 1 "
+                "AND n.entity_type = 'job' AND n.note_type = 'debug' AND n.status = 'open' "
+                "AND n.deleted_at IS NULL "
+                "ORDER BY n.updated_at DESC, n.id LIMIT 20",
+                (experiment_id,),
+            ).fetchall()
+        ]
+        return {
+            "debug_notes": debug_notes,
+            "validations": self._superseded_validation_rows(experiment_id),
+        }
+
+    def _superseded_validation_rows(self, experiment_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM validations WHERE entity_type = 'experiment' AND entity_id = ? "
+            "AND deleted_at IS NULL ORDER BY check_name, updated_at DESC, id DESC",
+            (experiment_id,),
+        ).fetchall()
+        latest_pass_by_key: dict[str, sqlite3.Row] = {}
+        for row in rows:
+            if row["status"] == "pass" and row["check_name"] not in latest_pass_by_key:
+                latest_pass_by_key[str(row["check_name"])] = row
+        superseded = [
+            self._validation_dict(row)
+            for row in rows
+            if row["status"] in {"fail", "warning", "unknown"}
+            and row["check_name"] in latest_pass_by_key
+            and latest_pass_by_key[row["check_name"]]["updated_at"] >= row["updated_at"]
+        ]
+        return superseded[:20]
+
+    def _cleanup_checkpoint_body(self, *, planned: dict[str, list[dict[str, Any]]], counts: dict[str, int]) -> str:
+        lines = [
+            "# Experiment Cleanup",
+            "",
+            "## Summary",
+            "",
+            f"- Debug notes resolved: {counts['debug_notes_resolved']}",
+            f"- Validations archived: {counts['validations_archived']}",
+        ]
+        if planned["debug_notes"]:
+            lines.extend(["", "## Resolved Debug Notes", ""])
+            for note in planned["debug_notes"]:
+                lines.append(f"- `{note['id']}` {note.get('title') or note.get('body_preview') or ''}".rstrip())
+        if planned["validations"]:
+            lines.extend(["", "## Archived Superseded Validations", ""])
+            for validation in planned["validations"]:
+                lines.append(f"- `{validation['id']}` {validation['check_name']} status=`{validation['status']}`")
+        return "\n".join(lines).rstrip() + "\n"
 
     def _upsert_metric(
         self,

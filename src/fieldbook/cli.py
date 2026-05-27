@@ -68,6 +68,9 @@ def _with_repo(args: argparse.Namespace, command: Command) -> int:
 def _is_read_only(args: argparse.Namespace) -> bool:
     command = getattr(args, "command", None)
     if command == "experiment":
+        experiment_command = getattr(args, "experiment_command", None)
+        if experiment_command == "cleanup":
+            return not getattr(args, "apply", False)
         return getattr(args, "experiment_command", None) in {
             "list",
             "show",
@@ -176,11 +179,84 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             locality_recent_days=args.locality_recent_days,
             cwd=Path.cwd(),
             resolved_via=resolution.resolved_via,
+            experiment_ref=args.experiment,
         )
     except ValueError as exc:
         raise ValidationError(str(exc)) from exc
     emit(envelope, json_output=args.json, text=format_doctor_text(envelope))
     return ExitCode.VALIDATION_ERROR if doctor_failed(envelope, strict=args.strict) else ExitCode.SUCCESS
+
+
+def _cmd_experiment_workloop(args: argparse.Namespace) -> int:
+    if not args.checkpoint and (args.body is not None or args.body_file is not None or args.body_stdin):
+        raise ValidationError("workloop body sources require --checkpoint")
+    if args.refresh and args.refresh_all:
+        raise ValidationError("workloop refresh requires --refresh or --refresh-all, not both")
+    resolution = resolve_ledger_location(ledger=args.ledger)
+    ledger_path = resolution.path
+    if ledger_path is None:
+        raise NotFoundError("Fieldbook ledger not found; run `fieldbook init` first")
+    needs_write = args.checkpoint or args.apply or bool(args.refresh) or args.refresh_all
+    conn = connect(ledger_path, allow_newer_readonly=not needs_write)
+    try:
+        session_id, session_source, marker_status = _resolved_session_id(resolution)
+        repo = Repository(conn, current_session_id=session_id)
+        experiment = repo.get_experiment(args.experiment)
+        if args.checkpoint and experiment["deleted_at"] is not None:
+            raise ValidationError("workloop checkpoint requires an active experiment")
+        source_names: list[str] = []
+        refresh_payload = None
+        if args.refresh or args.refresh_all:
+            config_path = Path(args.config) if args.config else None
+            source_names = list(args.refresh or [])
+            if args.refresh_all:
+                listing = list_refresh_sources(ledger_path=ledger_path, config_path=config_path)
+                source_names = [source["name"] for source in listing["sources"]]
+            refresh_payload = run_refresh(
+                repo,
+                ledger_path=ledger_path,
+                config_path=config_path,
+                source_names=source_names,
+                experiment_ref=experiment["id"],
+                apply=args.apply,
+            )
+        status = repo.experiment_status(experiment["id"], stale_hours=args.stale_hours)
+        doctor = run_doctor(
+            ledger_path,
+            check_ids=None,
+            stale_hours=args.stale_hours,
+            cwd=Path.cwd(),
+            experiment_ref=experiment["id"],
+            resolved_via=resolution.resolved_via,
+        )
+        payload = _workloop_payload(
+            status=status,
+            doctor=doctor,
+            resolution=resolution,
+            session_id=session_id,
+            session_source=session_source,
+            marker_status=marker_status,
+            refresh_payload=refresh_payload,
+        )
+        if refresh_payload is not None:
+            payload["refresh_request"] = {
+                "all": args.refresh_all,
+                "sources": source_names,
+                "apply": args.apply,
+            }
+        if args.checkpoint:
+            checkpoint = repo.checkpoint_experiment(
+                experiment["id"],
+                body=_resolve_optional_body(args),
+                archive=False,
+                errata=False,
+                stale_hours=args.stale_hours,
+            )
+            payload["checkpoint"] = checkpoint
+    finally:
+        conn.close()
+    emit(payload, json_output=args.json, text=_format_workloop_markdown(payload))
+    return ExitCode.SUCCESS
 
 
 def _cmd_experiment_triage(args: argparse.Namespace) -> int:
@@ -409,6 +485,110 @@ def _format_triage_markdown(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _workloop_payload(
+    *,
+    status: dict[str, Any],
+    doctor: dict[str, Any],
+    resolution: LedgerResolution,
+    session_id: str | None,
+    session_source: str | None,
+    marker_status: str,
+    refresh_payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    jobs = {
+        "active": status["ready"]["active_job_count"],
+        "failed": status["job_counts"].get("failed", 0),
+        "blockers": status["blocking_failed_jobs"],
+        "stale": status["stale_jobs"],
+        "submission_in_progress": status["submission_in_progress_jobs"],
+        "submission_unknown": status["submission_unknown_jobs"],
+        "recovery_in_progress": status["recovery_in_progress_failed_jobs"],
+        "recovered_failed": status["recovered_failed_jobs"],
+    }
+    payload = {
+        "experiment": status["experiment"],
+        "locality": db_where_payload(resolution),
+        "session": {
+            "current_session_id": session_id,
+            "session_source": session_source,
+            "marker_status": marker_status,
+        },
+        "runs": status["runs"],
+        "jobs": jobs,
+        "validations": status["validations"],
+        "freshness": status["freshness"],
+        "notes": status["notes"],
+        "doctor": {
+            "ok": doctor["ok"],
+            "scoped_issue_count": doctor["issue_count"],
+            "global_omitted_count": doctor.get("global_omitted_count", 0),
+            "issues": doctor["issues"][:20],
+        },
+        "suggested_next_actions": _workloop_suggested_actions(status=status, doctor=doctor),
+    }
+    if refresh_payload is not None:
+        payload["refresh"] = refresh_payload
+    return payload
+
+
+def _workloop_suggested_actions(*, status: dict[str, Any], doctor: dict[str, Any]) -> list[dict[str, str]]:
+    experiment_id = status["experiment"]["id"]
+    actions: list[dict[str, str]] = []
+    if status["ready"]["active_job_count"]:
+        actions.append(
+            {
+                "label": "Refresh external job state",
+                "command": f"fieldbook experiment workloop {experiment_id} --refresh <source> --apply --json",
+            }
+        )
+    if doctor["issue_count"]:
+        actions.append(
+            {
+                "label": "Inspect scoped doctor issues",
+                "command": f"fieldbook doctor --experiment {experiment_id} --json",
+            }
+        )
+    if status["freshness"].get("checkpoint_status") in {"missing", "stale"}:
+        actions.append(
+            {
+                "label": "Write experiment checkpoint",
+                "command": f"fieldbook experiment workloop {experiment_id} --checkpoint --body-file <handoff.md> --json",
+            }
+        )
+    if not actions:
+        actions.append(
+            {
+                "label": "Continue active experiment work",
+                "command": f"fieldbook experiment workloop {experiment_id} --json",
+            }
+        )
+    return actions
+
+
+def _format_workloop_markdown(payload: dict[str, Any]) -> str:
+    experiment = payload["experiment"]
+    lines = [
+        f"# Fieldbook Workloop: {experiment['name']}",
+        "",
+        f"- Experiment: `{experiment['id']}`",
+        f"- Runs: `{payload['runs']['total']}`",
+        f"- Active jobs: `{payload['jobs']['active']}`",
+        f"- Doctor issues: `{payload['doctor']['scoped_issue_count']}`",
+        f"- Omitted global issues: `{payload['doctor']['global_omitted_count']}`",
+        f"- Checkpoint status: `{payload['freshness'].get('checkpoint_status')}`",
+        "",
+        "## Suggested Next Actions",
+        "",
+    ]
+    for action in payload["suggested_next_actions"]:
+        lines.append(f"- {action['label']}: `{action['command']}`")
+    if payload["doctor"]["issues"]:
+        lines.extend(["", "## Scoped Doctor Issues", ""])
+        for issue in payload["doctor"]["issues"][:10]:
+            lines.append(f"- `{issue['code']}` {issue['message']}")
+    return "\n".join(lines)
+
+
 def _format_closeout_markdown(payload: dict[str, Any]) -> str:
     lines = [f"# Fieldbook Closeout Checklist: {payload['experiment']['name']}", ""]
     for item in payload["items"]:
@@ -480,6 +660,10 @@ def _experiment_checkpoint(args: argparse.Namespace, repo: Repository) -> dict[s
         errata=args.errata,
         stale_hours=args.stale_hours,
     )
+
+
+def _experiment_cleanup(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.cleanup_experiment(args.experiment, apply=args.apply)
 
 
 def _run_add(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
@@ -1251,6 +1435,7 @@ def _add_doctor_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--retry-loop-threshold", type=int, default=3)
     parser.add_argument("--stale-refresh-snapshot-days", type=float, default=30.0)
     parser.add_argument("--locality-recent-days", type=float, default=7.0)
+    parser.add_argument("--experiment")
     parser.add_argument("--strict", action="store_true")
     parser.set_defaults(func=_cmd_doctor)
 
@@ -1338,6 +1523,21 @@ def _add_experiment_parsers(subparsers: argparse._SubParsersAction) -> None:
     context.add_argument("--stale-hours", type=float, default=24.0)
     context.set_defaults(func=_repo_command(_experiment_context))
 
+    workloop = commands.add_parser("workloop")
+    _add_common_options(workloop)
+    workloop.add_argument("experiment")
+    workloop.add_argument("--stale-hours", type=float, default=24.0)
+    workloop.add_argument("--refresh", action="append", default=[])
+    workloop.add_argument("--refresh-all", action="store_true")
+    workloop.add_argument("--config")
+    workloop.add_argument("--apply", action="store_true")
+    workloop.add_argument("--checkpoint", action="store_true")
+    workloop_body_group = workloop.add_mutually_exclusive_group()
+    workloop_body_group.add_argument("--body")
+    workloop_body_group.add_argument("--body-file")
+    workloop_body_group.add_argument("--body-stdin", action="store_true")
+    workloop.set_defaults(func=_cmd_experiment_workloop)
+
     triage = commands.add_parser("triage")
     _add_common_options(triage)
     triage.add_argument("experiment")
@@ -1366,6 +1566,12 @@ def _add_experiment_parsers(subparsers: argparse._SubParsersAction) -> None:
     checkpoint.add_argument("--errata", action="store_true")
     checkpoint.add_argument("--stale-hours", type=float, default=24.0)
     checkpoint.set_defaults(func=_repo_command(_experiment_checkpoint))
+
+    cleanup = commands.add_parser("cleanup")
+    _common_repo_parser(cleanup)
+    cleanup.add_argument("experiment")
+    cleanup.add_argument("--apply", action="store_true")
+    cleanup.set_defaults(func=_repo_command(_experiment_cleanup))
 
 
 def _add_run_parsers(subparsers: argparse._SubParsersAction) -> None:

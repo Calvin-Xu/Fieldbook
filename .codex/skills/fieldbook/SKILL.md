@@ -14,9 +14,10 @@ or export collaborator-ready data.
   blockers or resume context the next agent must see, `note_type=next-action`
   for active work, `note_type=debug` for unresolved investigations, and
   `note_type=research` / `note_type=decision` for durable context.
-- Do not dump the entire ledger into context. Start with one experiment's
-  compact `status`, use `experiment context` when full handoff context is
-  needed, then drill into specific runs, jobs, artifacts, metrics, or notes.
+- Do not dump the entire ledger into context. Start active-experiment work with
+  `experiment workloop`, use `experiment status` for lower-level compact
+  counts, use `experiment context` when full handoff context is needed, then
+  drill into specific runs, jobs, artifacts, metrics, or notes.
 - Before mutating a ledger after a context switch, run `fieldbook db where
   --json` to confirm ledger locality and identity.
 - Use advisory sessions for agent context switching. They are provenance and
@@ -67,15 +68,18 @@ command or subcommand: `fieldbook experiment list --ledger <path> --json`.
 ```bash
 uv run fieldbook db where --json
 uv run fieldbook experiment list --json
+uv run fieldbook experiment workloop "$EXP_ID" --json
 uv run fieldbook experiment status "$EXP_ID" --json
 uv run fieldbook experiment context "$EXP_ID"
 uv run fieldbook experiment triage "$EXP_ID" --json
 ```
 
-Use the status payload to identify stale running jobs, failed jobs, key
-artifacts, freshness counts, open handoffs, open next actions, open debug notes,
-and recent research/decision previews. Use context for full Markdown note bodies. Then
-inspect only the relevant entities:
+Use `workloop` as the preferred bounded resume surface. It includes locality,
+session state, run/datapoint progress, jobs, validations, freshness, scoped
+doctor issues, and suggested next commands without launching, monitoring,
+refreshing, checkpointing, or cleanup unless explicit flags are passed. Use
+`context` for full Markdown note bodies. Then inspect only the relevant
+entities:
 
 ```bash
 uv run fieldbook job show "$JOB_ID" --json
@@ -111,6 +115,8 @@ than relying on memory or chat logs:
 
 ```bash
 uv run fieldbook refresh list-sources --json
+uv run fieldbook experiment workloop "$EXP_ID" --refresh iris_jobs --json
+uv run fieldbook experiment workloop "$EXP_ID" --refresh iris_jobs --apply --json
 uv run fieldbook refresh run --source iris_jobs --experiment "$EXP_ID" --json
 uv run fieldbook refresh run --source iris_jobs --experiment "$EXP_ID" --apply --json
 uv run fieldbook refresh log --json

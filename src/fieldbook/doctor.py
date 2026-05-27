@@ -104,6 +104,7 @@ def run_doctor(
     check_ids: list[str] | None,
     stale_hours: float,
     cwd: Path,
+    experiment_ref: str | None = None,
     stale_session_hours: float = 24.0,
     stale_submitting_hours: float = 1.0,
     stale_unknown_submit_hours: float = 6.0,
@@ -149,6 +150,20 @@ def run_doctor(
         issues: list[DoctorIssue] = []
         for check in selected_checks:
             issues.extend(check.runner(conn, options))
+        global_issue_count = len(issues)
+        if experiment_ref is not None:
+            experiment_id = _resolve_experiment_id(conn, experiment_ref)
+            issues = _filter_issues_for_experiment(conn, issues, experiment_id)
+            envelope = _envelope(
+                ledger_path=ledger_path,
+                schema=version,
+                checks=[check.id for check in selected_checks],
+                issues=issues,
+            )
+            envelope["experiment_id"] = experiment_id
+            envelope["global_issue_count"] = global_issue_count
+            envelope["global_omitted_count"] = max(global_issue_count - len(issues), 0)
+            return envelope
         return _envelope(
             ledger_path=ledger_path,
             schema=version,
@@ -187,6 +202,108 @@ def _selected_checks(check_ids: list[str] | None) -> list[DoctorCheck]:
         unknown_text = ", ".join(sorted(unknown))
         raise ValueError(f"unknown doctor check(s): {unknown_text}")
     return [DOCTOR_CHECKS[check_id] for check_id in check_ids]
+
+
+def _resolve_experiment_id(conn: sqlite3.Connection, ref: str) -> str:
+    row = conn.execute(
+        "SELECT id FROM experiments WHERE id = ? OR (name = ? AND deleted_at IS NULL) ORDER BY id",
+        (ref, ref),
+    ).fetchall()
+    if len(row) == 1:
+        return str(row[0]["id"])
+    if len(row) > 1:
+        raise ValueError(f"experiment reference {ref!r} is ambiguous")
+    raise ValueError(f"experiment not found: {ref}")
+
+
+def _filter_issues_for_experiment(
+    conn: sqlite3.Connection,
+    issues: list[DoctorIssue],
+    experiment_id: str,
+) -> list[DoctorIssue]:
+    return [
+        issue
+        for issue in issues
+        if experiment_id in _issue_experiment_ids(conn, issue)
+    ]
+
+
+def _issue_experiment_ids(conn: sqlite3.Connection, issue: DoctorIssue) -> set[str]:
+    if issue.entity_type == "experiment" and issue.entity_id:
+        return {issue.entity_id}
+    if issue.entity_type == "run" and issue.entity_id:
+        return _run_experiment_ids(conn, issue.entity_id)
+    if issue.entity_type == "job" and issue.entity_id:
+        return _job_experiment_ids(conn, issue.entity_id)
+    if issue.entity_type == "artifact" and issue.entity_id:
+        return _artifact_experiment_ids(conn, issue.entity_id)
+    if issue.entity_type == "note" and issue.entity_id:
+        row = conn.execute("SELECT entity_type, entity_id FROM notes WHERE id = ?", (issue.entity_id,)).fetchone()
+        if row:
+            return _target_experiment_ids(conn, str(row["entity_type"]), str(row["entity_id"]))
+    if issue.entity_type == "validation" and issue.entity_id:
+        row = conn.execute("SELECT entity_type, entity_id FROM validations WHERE id = ?", (issue.entity_id,)).fetchone()
+        if row:
+            return _target_experiment_ids(conn, str(row["entity_type"]), str(row["entity_id"]))
+    if issue.entity_type == "job_run" and issue.entity_id and ":" in issue.entity_id:
+        job_id, run_id = issue.entity_id.split(":", 1)
+        return _job_experiment_ids(conn, job_id) | _run_experiment_ids(conn, run_id)
+    return set()
+
+
+def _target_experiment_ids(conn: sqlite3.Connection, entity_type: str, entity_id: str) -> set[str]:
+    if entity_type == "experiment":
+        return {entity_id}
+    if entity_type == "run":
+        return _run_experiment_ids(conn, entity_id)
+    if entity_type == "job":
+        return _job_experiment_ids(conn, entity_id)
+    if entity_type == "artifact":
+        return _artifact_experiment_ids(conn, entity_id)
+    return set()
+
+
+def _run_experiment_ids(conn: sqlite3.Connection, run_id: str) -> set[str]:
+    ids = {
+        str(row["experiment_id"])
+        for row in conn.execute(
+            "SELECT experiment_id FROM experiment_runs WHERE run_id = ?",
+            (run_id,),
+        ).fetchall()
+        if row["experiment_id"]
+    }
+    row = conn.execute("SELECT experiment_id FROM runs WHERE id = ?", (run_id,)).fetchone()
+    if row and row["experiment_id"]:
+        ids.add(str(row["experiment_id"]))
+    return ids
+
+
+def _job_experiment_ids(conn: sqlite3.Connection, job_id: str) -> set[str]:
+    ids: set[str] = set()
+    row = conn.execute("SELECT experiment_id, run_id FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if not row:
+        return ids
+    if row["experiment_id"]:
+        ids.add(str(row["experiment_id"]))
+    if row["run_id"]:
+        ids.update(_run_experiment_ids(conn, str(row["run_id"])))
+    for edge in conn.execute("SELECT run_id FROM job_runs WHERE job_id = ? AND deleted_at IS NULL", (job_id,)).fetchall():
+        ids.update(_run_experiment_ids(conn, str(edge["run_id"])))
+    return ids
+
+
+def _artifact_experiment_ids(conn: sqlite3.Connection, artifact_id: str) -> set[str]:
+    ids: set[str] = set()
+    row = conn.execute("SELECT experiment_id, run_id, job_id FROM artifacts WHERE id = ?", (artifact_id,)).fetchone()
+    if not row:
+        return ids
+    if row["experiment_id"]:
+        ids.add(str(row["experiment_id"]))
+    if row["run_id"]:
+        ids.update(_run_experiment_ids(conn, str(row["run_id"])))
+    if row["job_id"]:
+        ids.update(_job_experiment_ids(conn, str(row["job_id"])))
+    return ids
 
 
 def _connect_readonly(path: Path) -> sqlite3.Connection:

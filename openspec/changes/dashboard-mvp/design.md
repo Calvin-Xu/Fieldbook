@@ -35,7 +35,9 @@ let the coding agent execute the appropriate workflow.
 `127.0.0.1` by default on port `8765`. A non-local host requires an explicit
 flag. Stopping the process stops the dashboard. The server handles SIGINT and
 SIGTERM with clean shutdown and does not write PID files, auto-restart, watch
-files, or auto-reload.
+files, or auto-reload. `--dry-run` is available as a testing affordance that
+resolves the ledger and reports the selected host/port without starting the
+server.
 
 The MVP uses the Python standard library HTTP server stack with simple
 server-rendered templates to keep Fieldbook portable. A later phase may change
@@ -81,6 +83,10 @@ Experiment index grouping uses these definitions:
 - stale: stale checkpoint, stale refresh, or stale lease heartbeat without a
   stronger needing-attention reason;
 - active: open experiment not in another group.
+
+Dashboard grouping uses the default one-hour stale lease threshold exposed by
+the Phase 18 stable views. CLI `status` and `workloop` remain the configurable
+surfaces when an agent needs a different threshold.
 
 If the resolved ledger path does not exist, `dashboard serve` exits with the
 same non-init ledger-not-found error as other non-init commands.

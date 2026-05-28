@@ -15,6 +15,7 @@ from fieldbook.adapters import (
     run_adapter,
     write_json_payload,
 )
+from fieldbook.dashboard import serve_dashboard, server_config
 from fieldbook.db import connect, discover_ledger, init_ledger, resolve_init_path
 from fieldbook.errors import ExitCode, FieldbookError, LedgerBusyError, NotFoundError, ValidationError
 from fieldbook.git_info import current_git_revision
@@ -157,6 +158,19 @@ def _cmd_sql(args: argparse.Namespace) -> int:
         print(stdout, end="")
     if stderr:
         print(stderr, end="", file=sys.stderr)
+    return ExitCode.SUCCESS
+
+
+def _cmd_dashboard_serve(args: argparse.Namespace) -> int:
+    ledger_path = discover_ledger(ledger=args.ledger)
+    config = server_config(host=args.host, port=args.port, allow_non_localhost=args.allow_non_localhost)
+    payload = {"ledger_path": str(ledger_path), **config}
+    if args.dry_run:
+        emit(payload, json_output=args.json)
+        return ExitCode.SUCCESS
+    if args.json:
+        emit(payload, json_output=True)
+    serve_dashboard(ledger_path, host=config["host"], port=config["port"], announce=not args.json)
     return ExitCode.SUCCESS
 
 
@@ -1476,6 +1490,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_snapshot_parsers(subparsers)
     _add_db_parsers(subparsers)
     _add_sql_parser(subparsers)
+    _add_dashboard_parser(subparsers)
     return parser
 
 
@@ -2094,6 +2109,19 @@ def _add_sql_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--max-output-bytes", type=int, default=DEFAULT_MAX_OUTPUT_BYTES)
     parser.add_argument("--allow-blobs", action="store_true")
     parser.set_defaults(func=_cmd_sql)
+
+
+def _add_dashboard_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("dashboard", help="Serve the read-only local dashboard")
+    commands = parser.add_subparsers(dest="dashboard_command", required=True)
+
+    serve = commands.add_parser("serve")
+    _add_common_options(serve)
+    serve.add_argument("--host")
+    serve.add_argument("--port", type=int)
+    serve.add_argument("--allow-non-localhost", action="store_true")
+    serve.add_argument("--dry-run", action="store_true")
+    serve.set_defaults(func=_cmd_dashboard_serve)
 
 
 def _add_export_parsers(subparsers: argparse._SubParsersAction) -> None:

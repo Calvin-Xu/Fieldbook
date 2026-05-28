@@ -330,6 +330,18 @@ parallel-agent ownership, stale monitors, expired claims, and force takeovers
 visible in `status`, `workloop`, doctor, and stable SQL views. Monitor attrs
 are observations only; they never update authoritative job status.
 
+Serve the optional read-only dashboard when a human wants to scan experiment
+state visually:
+
+```bash
+uv run fieldbook dashboard serve --json
+uv run fieldbook dashboard serve --host 127.0.0.1 --port 8765
+```
+
+The dashboard binds to `127.0.0.1:8765` by default, reads only stable `_v1`
+views, and exposes copyable Fieldbook commands or external links instead of
+write actions. Use the CLI or a coding agent for all mutations.
+
 For multiline Markdown notes, prefer a body file:
 
 ```bash

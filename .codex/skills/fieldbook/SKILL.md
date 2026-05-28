@@ -175,6 +175,16 @@ expired claims, and force takeovers in `status`, `workloop`, doctor, and stable
 SQL views. Lease attrs are monitor observations only; update authoritative job
 status through `job update-status` or reconcile.
 
+Use the dashboard only as a read-only human scan surface:
+
+```bash
+uv run fieldbook dashboard serve --json
+```
+
+The dashboard reads stable `_v1` views and shows copyable commands or external
+links. It has no write routes; run mutations through Fieldbook CLI/reconcile
+paths from the coding agent.
+
 ## Record Work
 
 Create an experiment:

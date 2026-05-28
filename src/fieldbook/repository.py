@@ -43,6 +43,9 @@ STATUS_RECENT_NOTE_LIMIT = 5
 CONTEXT_ACTIVE_NOTE_LIMIT = 20
 CONTEXT_RECENT_NOTE_LIMIT = 5
 NOTE_PREVIEW_CHARS = 200
+LEASE_ENTITY_TYPES = {"experiment", "run", "job"}
+LEASE_RELEASE_REASONS = {"released", "handoff", "done", "expired", "force_takeover", "cancelled"}
+LEASE_SUMMARY_LIMIT = 20
 
 
 class Repository:
@@ -152,7 +155,13 @@ class Repository:
             "freshness": freshness,
         }
 
-    def experiment_status(self, ref: str, *, stale_hours: float = 24.0) -> dict[str, Any]:
+    def experiment_status(
+        self,
+        ref: str,
+        *,
+        stale_hours: float = 24.0,
+        stale_lease_hours: float = 1.0,
+    ) -> dict[str, Any]:
         experiment = self.get_experiment(ref)
         experiment_id = experiment["id"]
         run_count = self.conn.execute(
@@ -250,6 +259,7 @@ class Repository:
                 "erratum_count": self._experiment_errata_count(experiment_id),
                 "recent_errata": errata_rows,
             },
+            "leases": self.lease_summary_for_experiment(experiment_id, stale_hours=stale_lease_hours),
         }
 
     def experiment_context(self, ref: str, *, stale_hours: float = 24.0) -> dict[str, Any]:
@@ -360,6 +370,168 @@ class Repository:
             "planned": planned,
             "counts": counts,
             "checkpoint": checkpoint,
+        }
+
+    def claim_lease(
+        self,
+        *,
+        entity_type: str,
+        entity_ref: str,
+        owner_agent: str,
+        session_ref: str | None,
+        expires_at: str | None,
+        attrs: dict[str, Any],
+        force: bool,
+    ) -> dict[str, Any]:
+        entity_type = require_choice(entity_type, LEASE_ENTITY_TYPES, "lease entity type")
+        entity_id = self._active_entity_id(entity_type, entity_ref)
+        owner_agent = self._validate_owner_agent(owner_agent)
+        session_id = self._resolve_lease_session_id(session_ref)
+        expires_at = validate_utc_z(expires_at, "expires_at")
+        validate_attrs_dict(attrs)
+        now = utc_now()
+        with self.conn:
+            existing = self.conn.execute(
+                "SELECT * FROM leases WHERE entity_type = ? AND entity_id = ? AND released_at IS NULL",
+                (entity_type, entity_id),
+            ).fetchone()
+            takeover: dict[str, Any] | None = None
+            previous_lease_id = None
+            if existing is not None and existing["owner_agent"] == owner_agent:
+                merged_attrs = {**load_attrs(existing["attrs_json"]), **attrs}
+                self.conn.execute(
+                    "UPDATE leases SET heartbeat_at = ?, attrs_json = ? WHERE id = ?",
+                    (now, attrs_json(merged_attrs), existing["id"]),
+                )
+                return {"lease": self.get_lease(existing["id"]), "existed": True, "takeover": None}
+            if existing is not None:
+                expired = existing["expires_at"] is not None and existing["expires_at"] <= now
+                if not expired and not force:
+                    raise ValidationError(
+                        f"lease conflict: {entity_type} {entity_id} is owned by {existing['owner_agent']}"
+                    )
+                release_reason = "expired" if expired else "force_takeover"
+                self.conn.execute(
+                    "UPDATE leases SET released_at = ?, released_by = ?, released_session_id = ?, "
+                    "release_reason = ? WHERE id = ?",
+                    (now, owner_agent, session_id, release_reason, existing["id"]),
+                )
+                previous_lease_id = existing["id"]
+                takeover = self._lease_dict(
+                    self.conn.execute("SELECT * FROM leases WHERE id = ?", (existing["id"],)).fetchone()
+                )
+            lease_id = new_id("lea")
+            self.conn.execute(
+                "INSERT INTO leases (id, entity_type, entity_id, owner_agent, session_id, claimed_at, "
+                "heartbeat_at, expires_at, previous_lease_id, attrs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    lease_id,
+                    entity_type,
+                    entity_id,
+                    owner_agent,
+                    session_id,
+                    now,
+                    now,
+                    expires_at,
+                    previous_lease_id,
+                    attrs_json(attrs),
+                ),
+            )
+        return {"lease": self.get_lease(lease_id), "existed": False, "takeover": takeover}
+
+    def heartbeat_lease(self, ref: str, *, owner_agent: str | None, attrs: dict[str, Any]) -> dict[str, Any]:
+        lease = self.get_lease(ref)
+        if lease["released_at"] is not None:
+            raise ValidationError(f"lease is already released: {lease['id']}")
+        if owner_agent is not None and lease["owner_agent"] != owner_agent:
+            raise ValidationError(f"lease heartbeat owner mismatch: {lease['owner_agent']}")
+        validate_attrs_dict(attrs)
+        merged_attrs = {**lease["attrs"], **attrs}
+        now = utc_now()
+        with self.conn:
+            self.conn.execute(
+                "UPDATE leases SET heartbeat_at = ?, attrs_json = ? WHERE id = ?",
+                (now, attrs_json(merged_attrs), lease["id"]),
+            )
+        return self.get_lease(lease["id"])
+
+    def release_lease(self, ref: str, *, owner_agent: str | None, reason: str) -> dict[str, Any]:
+        reason = require_choice(reason, LEASE_RELEASE_REASONS, "lease release reason")
+        lease = self.get_lease(ref)
+        if lease["released_at"] is not None:
+            return lease
+        if owner_agent is not None and lease["owner_agent"] != owner_agent:
+            raise ValidationError(f"lease release owner mismatch: {lease['owner_agent']}")
+        now = utc_now()
+        with self.conn:
+            self.conn.execute(
+                "UPDATE leases SET released_at = ?, released_by = ?, released_session_id = ?, release_reason = ? "
+                "WHERE id = ?",
+                (now, owner_agent or lease["owner_agent"], self.current_session_id, reason, lease["id"]),
+            )
+        return self.get_lease(lease["id"])
+
+    def get_lease(self, ref: str) -> dict[str, Any]:
+        row = self._resolve_row("leases", ref)
+        return self._lease_dict(row)
+
+    def list_leases(
+        self,
+        *,
+        entity_type: str | None = None,
+        entity_ref: str | None = None,
+        include_released: bool = False,
+        owner_agent: str | None = None,
+    ) -> dict[str, Any]:
+        params: list[Any] = [1 if include_released else 0]
+        query = "SELECT * FROM leases WHERE (? OR released_at IS NULL)"
+        if entity_type:
+            entity_type = require_choice(entity_type, LEASE_ENTITY_TYPES, "lease entity type")
+            query += " AND entity_type = ?"
+            params.append(entity_type)
+        if entity_ref:
+            if not entity_type:
+                raise ValidationError("--entity-id requires --entity-type")
+            query += " AND entity_id = ?"
+            params.append(self._resolve_entity_id(entity_type, entity_ref))
+        if owner_agent:
+            query += " AND owner_agent = ?"
+            params.append(owner_agent)
+        query += " ORDER BY heartbeat_at DESC, id LIMIT 100"
+        return {"leases": [self._lease_dict(row) for row in self.conn.execute(query, params).fetchall()]}
+
+    def lease_summary_for_experiment(self, experiment_id: str, *, stale_hours: float) -> dict[str, Any]:
+        leases = [
+            self._lease_dict(row)
+            for row in self.conn.execute(
+                "SELECT * FROM leases WHERE released_at IS NULL ORDER BY heartbeat_at DESC, id"
+            ).fetchall()
+            if experiment_id in self._lease_experiment_ids(row)
+        ]
+        stale_cutoff = (
+            datetime.now(timezone.utc).replace(microsecond=0) - timedelta(hours=stale_hours)
+        ).isoformat().replace("+00:00", "Z")
+        now = utc_now()
+        stale = [lease for lease in leases if lease["heartbeat_at"] < stale_cutoff]
+        expired = [
+            lease for lease in leases if lease["expires_at"] is not None and lease["expires_at"] <= now
+        ]
+        force_history = [
+            self._lease_dict(row)
+            for row in self.conn.execute(
+                "SELECT * FROM leases WHERE release_reason = 'force_takeover' ORDER BY released_at DESC, id LIMIT 100"
+            ).fetchall()
+            if experiment_id in self._lease_experiment_ids(row)
+        ]
+        return {
+            "active_count": len(leases),
+            "stale_count": len(stale),
+            "expired_count": len(expired),
+            "active": leases[:LEASE_SUMMARY_LIMIT],
+            "stale": stale[:LEASE_SUMMARY_LIMIT],
+            "expired": expired[:LEASE_SUMMARY_LIMIT],
+            "force_takeovers": force_history[:LEASE_SUMMARY_LIMIT],
+            "stale_threshold_hours": stale_hours,
         }
 
     def add_run(
@@ -2118,6 +2290,43 @@ class Repository:
             ).fetchall()
         ]
 
+    def _job_experiment_ids(self, job_id: str) -> set[str]:
+        ids: set[str] = set()
+        row = self.conn.execute("SELECT experiment_id, run_id FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if row is None:
+            return ids
+        if row["experiment_id"]:
+            ids.add(str(row["experiment_id"]))
+        if row["run_id"]:
+            ids.update(str(experiment_id) for experiment_id in self._run_experiment_ids(str(row["run_id"])))
+        for edge in self.conn.execute("SELECT run_id FROM job_runs WHERE job_id = ? AND deleted_at IS NULL", (job_id,)):
+            ids.update(str(experiment_id) for experiment_id in self._run_experiment_ids(str(edge["run_id"])))
+        return ids
+
+    def _lease_experiment_ids(self, row: sqlite3.Row | dict[str, Any]) -> set[str]:
+        entity_type = str(row["entity_type"])
+        entity_id = str(row["entity_id"])
+        if entity_type == "experiment":
+            return {entity_id}
+        if entity_type == "run":
+            return set(str(experiment_id) for experiment_id in self._run_experiment_ids(entity_id))
+        if entity_type == "job":
+            return self._job_experiment_ids(entity_id)
+        return set()
+
+    def _resolve_lease_session_id(self, session_ref: str | None) -> str | None:
+        if session_ref is None:
+            return self.current_session_id
+        return self.get_session(session_ref)["id"]
+
+    def _validate_owner_agent(self, owner_agent: str) -> str:
+        normalized = owner_agent.strip()
+        if not normalized:
+            raise ValidationError("lease owner must not be empty")
+        if len(normalized) > 200:
+            raise ValidationError("lease owner must be at most 200 characters")
+        return normalized
+
     def _resolve_entity_id(self, entity_type: str, ref: str) -> str:
         table = {
             "experiment": "experiments",
@@ -2219,6 +2428,11 @@ class Repository:
     def _validation_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         data = dict(row)
         data["details"] = load_attrs(data.pop("details_json", "{}"))
+        data["attrs"] = load_attrs(data.pop("attrs_json", "{}"))
+        return data
+
+    def _lease_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        data = dict(row)
         data["attrs"] = load_attrs(data.pop("attrs_json", "{}"))
         return data
 

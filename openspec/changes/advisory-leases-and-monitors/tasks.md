@@ -7,56 +7,56 @@
 - [x] 1.3 Validate `advisory-leases-and-monitors`.
 - [x] 1.4 Run CC spec review with `env -u ANTHROPIC_API_KEY claude --resume 23592491-85d8-4d6e-9cd3-3dbe7f265110 --model claude-opus-4-7 --effort max`.
 - [x] 1.5 Patch spec blockers and revalidate.
-- [ ] 1.6 Begin implementation only after `active-experiment-workloop` is
+- [x] 1.6 Begin implementation only after `active-experiment-workloop` is
   implemented and pushed.
 
 Do not begin implementation tasks until 1.5 is complete.
 
 ## 2. Tests First
 
-- [ ] 2.1 Add failing tests for lease claim/list/show/release JSON and text
+- [x] 2.1 Add failing tests for lease claim/list/show/release JSON and text
   output.
-- [ ] 2.2 Add failing tests for duplicate claim conflicts, same owner/session
+- [x] 2.2 Add failing tests for duplicate claim conflicts, same owner/session
   idempotency, expired takeover, and force takeover audit.
-- [ ] 2.3 Add failing tests for heartbeat updates, stale heartbeat doctor
+- [x] 2.3 Add failing tests for heartbeat updates, stale heartbeat doctor
   warnings, and no auto-release from stale heartbeat.
-- [ ] 2.4 Add failing tests for lease rejection on archived or missing
+- [x] 2.4 Add failing tests for lease rejection on archived or missing
   entities and doctor warnings for orphaned leases.
-- [ ] 2.5 Add failing tests proving lease attrs do not mutate authoritative
+- [x] 2.5 Add failing tests proving lease attrs do not mutate authoritative
   job/run/experiment state.
-- [ ] 2.6 Add failing tests for status/context/workloop lease summaries and
+- [x] 2.6 Add failing tests for status/context/workloop lease summaries and
   bounded examples.
-- [ ] 2.7 Add failing tests for stable lease views and retry depth derived from
+- [x] 2.7 Add failing tests for stable lease views and retry depth derived from
   job retry lineage.
 
 ## 3. Schema And Views
 
-- [ ] 3.1 Add a migration for leases, constraints, indexes, and history.
-- [ ] 3.2 Add stable views for active leases, stale leases, lease history, and
+- [x] 3.1 Add a migration for leases, constraints, indexes, and history.
+- [x] 3.2 Add stable views for active leases, stale leases, lease history, and
   ownership summaries by experiment/run/job.
-- [ ] 3.3 Ensure view output filters archived/deleted entities consistently
+- [x] 3.3 Ensure view output filters archived/deleted entities consistently
   with existing `_v1` view conventions.
 
 ## 4. Repository And CLI
 
-- [ ] 4.1 Add repository helpers for claim, heartbeat, release, force takeover,
+- [x] 4.1 Add repository helpers for claim, heartbeat, release, force takeover,
   expired takeover, list, and show.
-- [ ] 4.2 Add `fieldbook lease claim|heartbeat|release|list|show`.
-- [ ] 4.3 Add JSON envelopes and concise text output for agent workflows.
-- [ ] 4.4 Add validation for entity type, ownership fields, timestamps,
+- [x] 4.2 Add `fieldbook lease claim|heartbeat|release|list|show`.
+- [x] 4.3 Add JSON envelopes and concise text output for agent workflows.
+- [x] 4.4 Add validation for entity type, ownership fields, timestamps,
   release reasons, and attrs JSON.
 
 ## 5. Agent Surfaces, Doctor, Docs
 
-- [ ] 5.1 Add lease summaries to experiment status, context, and workloop.
-- [ ] 5.2 Add doctor checks for stale heartbeat, expired lease, orphaned
+- [x] 5.1 Add lease summaries to experiment status, context, and workloop.
+- [x] 5.2 Add doctor checks for stale heartbeat, expired lease, orphaned
   entity, active lease on ended session, and conflicting active lease history.
-- [ ] 5.3 Update README and Fieldbook skill guidance for babysit loops and
+- [x] 5.3 Update README and Fieldbook skill guidance for babysit loops and
   parallel-agent coordination.
 
 ## 6. Validation And Implementation Review
 
-- [ ] 6.1 Run OpenSpec validation, py_compile, and full tests.
-- [ ] 6.2 Run CC implementation review with `env -u ANTHROPIC_API_KEY claude --resume 23592491-85d8-4d6e-9cd3-3dbe7f265110 --model claude-opus-4-7 --effort max`.
-- [ ] 6.3 Patch CC blockers and rerun validation.
-- [ ] 6.4 Commit and push the implementation.
+- [x] 6.1 Run OpenSpec validation, py_compile, and full tests.
+- [x] 6.2 Run CC implementation review with `env -u ANTHROPIC_API_KEY claude --resume 23592491-85d8-4d6e-9cd3-3dbe7f265110 --model claude-opus-4-7 --effort max`.
+- [x] 6.3 Patch CC blockers and rerun validation.
+- [x] 6.4 Commit and push the implementation.

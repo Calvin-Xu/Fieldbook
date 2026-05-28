@@ -159,6 +159,22 @@ experiment, opens the new session, updates the marker, and prints the target
 experiment context. Sessions are advisory: multiple open sessions are allowed,
 and stale sessions are doctor warnings rather than locks.
 
+Use advisory leases when a long-running agent owns a babysit loop or when
+multiple agents are coordinating in the same repo:
+
+```bash
+uv run fieldbook lease claim --entity-type experiment --entity-id "$EXP_ID" --owner codex --json
+uv run fieldbook lease claim --entity-type job --entity-id "$JOB_ID" --owner babysitter --expires-at "$EXPIRES_AT" --json
+uv run fieldbook lease heartbeat "$LEASE_ID" --owner babysitter --attr monitor.observed_status=running --json
+uv run fieldbook lease release "$LEASE_ID" --owner babysitter --reason handoff --json
+uv run fieldbook doctor --check leases --json
+```
+
+Leases are advisory, not locks. They surface ownership, stale heartbeats,
+expired claims, and force takeovers in `status`, `workloop`, doctor, and stable
+SQL views. Lease attrs are monitor observations only; update authoritative job
+status through `job update-status` or reconcile.
+
 ## Record Work
 
 Create an experiment:

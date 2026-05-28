@@ -122,7 +122,9 @@ existing view conventions.
 - `v_leases_active_v1`: `id`, `entity_type`, `entity_id`, `owner_agent`,
   `session_id`, `claimed_at`, `heartbeat_at`, `expires_at`, `attrs_json`.
 - `v_leases_stale_v1`: active lease columns plus `stale_hours` and
-  `stale_threshold_hours`.
+  `stale_threshold_hours`. This view uses the default 1-hour threshold because
+  SQL views are not parameterized; CLI/status/workloop thresholds remain the
+  authoritative configurable surfaces.
 - `v_lease_history_v1`: active and released lease columns plus `released_at`,
   `released_by`, `released_session_id`, `release_reason`, and
   `previous_lease_id` when applicable.

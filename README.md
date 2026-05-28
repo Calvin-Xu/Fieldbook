@@ -314,6 +314,22 @@ session stamping; unset it in the parent shell after ending an env-selected
 session. Starting or switching a session also appends `.fieldbook.session` to
 the marker directory's `.gitignore` when needed.
 
+Use advisory leases when a long-running agent owns monitoring or when multiple
+agents are working in the same repo:
+
+```bash
+uv run fieldbook lease claim --entity-type experiment --entity-id "$EXP_ID" --owner codex --json
+uv run fieldbook lease claim --entity-type job --entity-id "$JOB_ID" --owner babysitter --expires-at "$EXPIRES_AT" --json
+uv run fieldbook lease heartbeat "$LEASE_ID" --owner babysitter --attr monitor.observed_status=running --json
+uv run fieldbook lease release "$LEASE_ID" --owner babysitter --reason handoff --json
+uv run fieldbook doctor --check leases --json
+```
+
+Leases are advisory ownership records, not locks. They make babysit loops,
+parallel-agent ownership, stale monitors, expired claims, and force takeovers
+visible in `status`, `workloop`, doctor, and stable SQL views. Monitor attrs
+are observations only; they never update authoritative job status.
+
 For multiline Markdown notes, prefer a body file:
 
 ```bash

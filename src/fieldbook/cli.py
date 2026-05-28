@@ -89,6 +89,8 @@ def _is_read_only(args: argparse.Namespace) -> bool:
         return getattr(args, "metric_command", None) == "list"
     if command == "validation":
         return getattr(args, "validation_command", None) in {"list", "show"}
+    if command == "lease":
+        return getattr(args, "lease_command", None) in {"list", "show"}
     if command == "note":
         return getattr(args, "note_command", None) in {"list", "show"}
     if command == "reconcile":
@@ -171,6 +173,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             ledger_path,
             check_ids=args.check,
             stale_hours=args.stale_hours,
+            stale_lease_hours=args.stale_lease_hours,
             stale_session_hours=args.stale_session_hours,
             stale_submitting_hours=args.stale_submitting_hours,
             stale_unknown_submit_hours=args.stale_unknown_submit_hours,
@@ -220,11 +223,16 @@ def _cmd_experiment_workloop(args: argparse.Namespace) -> int:
                 experiment_ref=experiment["id"],
                 apply=args.apply,
             )
-        status = repo.experiment_status(experiment["id"], stale_hours=args.stale_hours)
+        status = repo.experiment_status(
+            experiment["id"],
+            stale_hours=args.stale_hours,
+            stale_lease_hours=args.stale_lease_hours,
+        )
         doctor = run_doctor(
             ledger_path,
             check_ids=None,
             stale_hours=args.stale_hours,
+            stale_lease_hours=args.stale_lease_hours,
             cwd=Path.cwd(),
             experiment_ref=experiment["id"],
             resolved_via=resolution.resolved_via,
@@ -517,6 +525,7 @@ def _workloop_payload(
         "jobs": jobs,
         "validations": status["validations"],
         "freshness": status["freshness"],
+        "leases": status["leases"],
         "notes": status["notes"],
         "doctor": {
             "ok": doctor["ok"],
@@ -555,6 +564,13 @@ def _workloop_suggested_actions(*, status: dict[str, Any], doctor: dict[str, Any
                 "command": f"fieldbook experiment workloop {experiment_id} --checkpoint --body-file <handoff.md> --json",
             }
         )
+    if status.get("leases", {}).get("stale_count", 0) or status.get("leases", {}).get("expired_count", 0):
+        actions.append(
+            {
+                "label": "Resolve stale or expired advisory leases",
+                "command": f"fieldbook lease list --entity-type experiment --entity-id {experiment_id} --json",
+            }
+        )
     if not actions:
         actions.append(
             {
@@ -573,6 +589,8 @@ def _format_workloop_markdown(payload: dict[str, Any]) -> str:
         f"- Experiment: `{experiment['id']}`",
         f"- Runs: `{payload['runs']['total']}`",
         f"- Active jobs: `{payload['jobs']['active']}`",
+        f"- Active leases: `{payload['leases']['active_count']}`",
+        f"- Stale leases: `{payload['leases']['stale_count']}`",
         f"- Doctor issues: `{payload['doctor']['scoped_issue_count']}`",
         f"- Omitted global issues: `{payload['doctor']['global_omitted_count']}`",
         f"- Checkpoint status: `{payload['freshness'].get('checkpoint_status')}`",
@@ -638,7 +656,11 @@ def _experiment_show(args: argparse.Namespace, repo: Repository) -> dict[str, An
 
 
 def _experiment_status(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
-    return repo.experiment_status(args.experiment, stale_hours=args.stale_hours)
+    return repo.experiment_status(
+        args.experiment,
+        stale_hours=args.stale_hours,
+        stale_lease_hours=args.stale_lease_hours,
+    )
 
 
 def _experiment_context(args: argparse.Namespace, repo: Repository) -> dict[str, Any] | str:
@@ -664,6 +686,39 @@ def _experiment_checkpoint(args: argparse.Namespace, repo: Repository) -> dict[s
 
 def _experiment_cleanup(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
     return repo.cleanup_experiment(args.experiment, apply=args.apply)
+
+
+def _lease_claim(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.claim_lease(
+        entity_type=args.entity_type,
+        entity_ref=args.entity_id,
+        owner_agent=args.owner,
+        session_ref=args.session,
+        expires_at=args.expires_at,
+        attrs=parse_attrs(args.attr),
+        force=args.force,
+    )
+
+
+def _lease_heartbeat(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.heartbeat_lease(args.lease, owner_agent=args.owner, attrs=parse_attrs(args.attr))
+
+
+def _lease_release(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.release_lease(args.lease, owner_agent=args.owner, reason=args.reason)
+
+
+def _lease_list(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.list_leases(
+        entity_type=args.entity_type,
+        entity_ref=args.entity_id,
+        include_released=args.include_released,
+        owner_agent=args.owner,
+    )
+
+
+def _lease_show(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.get_lease(args.lease)
 
 
 def _run_add(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
@@ -1411,6 +1466,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_validation_parsers(subparsers)
     _add_note_parsers(subparsers)
     _add_session_parsers(subparsers)
+    _add_lease_parsers(subparsers)
     _add_reconcile_parsers(subparsers)
     _add_refresh_parsers(subparsers)
     _add_writeback_parsers(subparsers)
@@ -1429,6 +1485,7 @@ def _add_doctor_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--check", action="append", default=[])
     parser.add_argument("--list-checks", action="store_true")
     parser.add_argument("--stale-hours", type=float, default=24.0)
+    parser.add_argument("--stale-lease-hours", type=float, default=1.0)
     parser.add_argument("--stale-session-hours", type=float, default=24.0)
     parser.add_argument("--stale-submitting-hours", type=float, default=1.0)
     parser.add_argument("--stale-unknown-submit-hours", type=float, default=6.0)
@@ -1515,6 +1572,7 @@ def _add_experiment_parsers(subparsers: argparse._SubParsersAction) -> None:
     _common_repo_parser(status)
     status.add_argument("experiment")
     status.add_argument("--stale-hours", type=float, default=24.0)
+    status.add_argument("--stale-lease-hours", type=float, default=1.0)
     status.set_defaults(func=_repo_command(_experiment_status))
 
     context = commands.add_parser("context")
@@ -1527,6 +1585,7 @@ def _add_experiment_parsers(subparsers: argparse._SubParsersAction) -> None:
     _add_common_options(workloop)
     workloop.add_argument("experiment")
     workloop.add_argument("--stale-hours", type=float, default=24.0)
+    workloop.add_argument("--stale-lease-hours", type=float, default=1.0)
     workloop.add_argument("--refresh", action="append", default=[])
     workloop.add_argument("--refresh-all", action="store_true")
     workloop.add_argument("--config")
@@ -1839,6 +1898,49 @@ def _add_note_parsers(subparsers: argparse._SubParsersAction) -> None:
     _common_repo_parser(archive)
     archive.add_argument("note")
     archive.set_defaults(func=_repo_command(_note_archive))
+
+
+def _add_lease_parsers(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("lease", help="Manage advisory ownership leases")
+    commands = parser.add_subparsers(dest="lease_command", required=True)
+
+    claim = commands.add_parser("claim")
+    _common_repo_parser(claim)
+    claim.add_argument("--entity-type", required=True, choices=["experiment", "run", "job"])
+    claim.add_argument("--entity-id", required=True)
+    claim.add_argument("--owner", required=True)
+    claim.add_argument("--session")
+    claim.add_argument("--expires-at")
+    claim.add_argument("--force", action="store_true")
+    _add_attr_option(claim)
+    claim.set_defaults(func=_repo_command(_lease_claim))
+
+    heartbeat = commands.add_parser("heartbeat")
+    _common_repo_parser(heartbeat)
+    heartbeat.add_argument("lease")
+    heartbeat.add_argument("--owner")
+    _add_attr_option(heartbeat)
+    heartbeat.set_defaults(func=_repo_command(_lease_heartbeat))
+
+    release = commands.add_parser("release")
+    _common_repo_parser(release)
+    release.add_argument("lease")
+    release.add_argument("--owner")
+    release.add_argument("--reason", default="released")
+    release.set_defaults(func=_repo_command(_lease_release))
+
+    list_parser = commands.add_parser("list")
+    _common_repo_parser(list_parser)
+    list_parser.add_argument("--entity-type", choices=["experiment", "run", "job"])
+    list_parser.add_argument("--entity-id")
+    list_parser.add_argument("--owner")
+    list_parser.add_argument("--include-released", action="store_true")
+    list_parser.set_defaults(func=_repo_command(_lease_list))
+
+    show = commands.add_parser("show")
+    _common_repo_parser(show)
+    show.add_argument("lease")
+    show.set_defaults(func=_repo_command(_lease_show))
 
 
 def _add_reconcile_parsers(subparsers: argparse._SubParsersAction) -> None:

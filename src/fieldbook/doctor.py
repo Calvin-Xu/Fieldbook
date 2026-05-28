@@ -83,6 +83,7 @@ class DoctorCheck:
 @dataclass(frozen=True)
 class DoctorOptions:
     stale_hours: float
+    stale_lease_hours: float
     stale_session_hours: float
     stale_submitting_hours: float
     stale_unknown_submit_hours: float
@@ -105,6 +106,7 @@ def run_doctor(
     stale_hours: float,
     cwd: Path,
     experiment_ref: str | None = None,
+    stale_lease_hours: float = 1.0,
     stale_session_hours: float = 24.0,
     stale_submitting_hours: float = 1.0,
     stale_unknown_submit_hours: float = 6.0,
@@ -137,6 +139,7 @@ def run_doctor(
             )
         options = DoctorOptions(
             stale_hours=stale_hours,
+            stale_lease_hours=stale_lease_hours,
             stale_session_hours=stale_session_hours,
             stale_submitting_hours=stale_submitting_hours,
             stale_unknown_submit_hours=stale_unknown_submit_hours,
@@ -237,6 +240,10 @@ def _issue_experiment_ids(conn: sqlite3.Connection, issue: DoctorIssue) -> set[s
         return _job_experiment_ids(conn, issue.entity_id)
     if issue.entity_type == "artifact" and issue.entity_id:
         return _artifact_experiment_ids(conn, issue.entity_id)
+    if issue.entity_type == "lease" and issue.entity_id:
+        row = conn.execute("SELECT entity_type, entity_id FROM leases WHERE id = ?", (issue.entity_id,)).fetchone()
+        if row:
+            return _target_experiment_ids(conn, str(row["entity_type"]), str(row["entity_id"]))
     if issue.entity_type == "note" and issue.entity_id:
         row = conn.execute("SELECT entity_type, entity_id FROM notes WHERE id = ?", (issue.entity_id,)).fetchone()
         if row:
@@ -802,6 +809,115 @@ def _check_validations(conn: sqlite3.Connection, _options: DoctorOptions) -> lis
     return issues
 
 
+def _check_leases(conn: sqlite3.Connection, options: DoctorOptions) -> list[DoctorIssue]:
+    issues: list[DoctorIssue] = []
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    now_z = now.isoformat().replace("+00:00", "Z")
+    stale_cutoff = (now - timedelta(hours=options.stale_lease_hours)).isoformat().replace("+00:00", "Z")
+    rows = conn.execute("SELECT * FROM leases WHERE released_at IS NULL ORDER BY heartbeat_at, id").fetchall()
+    for row in rows:
+        lease_id = row["id"]
+        details = dict(row)
+        if row["heartbeat_at"] < stale_cutoff:
+            issues.append(
+                DoctorIssue(
+                    code="lease.stale_heartbeat",
+                    severity="warning",
+                    entity_type="lease",
+                    entity_id=lease_id,
+                    message="active lease heartbeat is stale",
+                    details=details,
+                    suggested_next_action="Heartbeat, release, or explicitly take over the stale advisory lease.",
+                )
+            )
+        if row["expires_at"] is not None and row["expires_at"] <= now_z:
+            issues.append(
+                DoctorIssue(
+                    code="lease.expired",
+                    severity="warning",
+                    entity_type="lease",
+                    entity_id=lease_id,
+                    message="active lease has expired but has not been released",
+                    details=details,
+                    suggested_next_action="Release the lease or claim it from the next active agent.",
+                )
+            )
+        if row["session_id"]:
+            session = conn.execute("SELECT ended_at FROM sessions WHERE id = ?", (row["session_id"],)).fetchone()
+            if session and session["ended_at"] is not None:
+                issues.append(
+                    DoctorIssue(
+                        code="lease.outlived_session",
+                        severity="warning",
+                        entity_type="lease",
+                        entity_id=lease_id,
+                        message="active lease references an ended session",
+                        details=details,
+                        suggested_next_action="Release or re-claim the lease from the current session.",
+                    )
+                )
+            if session is None:
+                issues.append(
+                    DoctorIssue(
+                        code="lease.orphaned",
+                        severity="warning",
+                        entity_type="lease",
+                        entity_id=lease_id,
+                        message="active lease references a missing session",
+                        details=details,
+                        suggested_next_action="Release or force-takeover the orphaned lease.",
+                    )
+                )
+        entity = _lease_entity_row(conn, row["entity_type"], row["entity_id"])
+        if entity is None:
+            issues.append(
+                DoctorIssue(
+                    code="lease.orphaned",
+                    severity="warning",
+                    entity_type="lease",
+                    entity_id=lease_id,
+                    message="active lease references a missing entity",
+                    details=details,
+                    suggested_next_action="Release or force-takeover the orphaned lease.",
+                )
+            )
+        elif "deleted_at" in entity.keys() and entity["deleted_at"] is not None:
+            issues.append(
+                DoctorIssue(
+                    code="lease.archived_entity",
+                    severity="warning",
+                    entity_type="lease",
+                    entity_id=lease_id,
+                    message="active lease references an archived or deleted entity",
+                    details=details,
+                    suggested_next_action="Release the lease or record a handoff on an active experiment.",
+                )
+            )
+    for row in conn.execute(
+        "SELECT entity_type, entity_id, COUNT(*) AS count FROM leases WHERE released_at IS NULL "
+        "GROUP BY entity_type, entity_id HAVING COUNT(*) > 1"
+    ).fetchall():
+        issues.append(
+            DoctorIssue(
+                code="lease.conflicting_active",
+                severity="error",
+                entity_type="lease",
+                entity_id=f"{row['entity_type']}:{row['entity_id']}",
+                message="entity has multiple active leases",
+                details=dict(row),
+                suggested_next_action="Repair duplicate active leases through a controlled migration.",
+            )
+        )
+    return issues
+
+
+def _lease_entity_row(conn: sqlite3.Connection, entity_type: str, entity_id: str) -> sqlite3.Row | None:
+    table = {"experiment": "experiments", "run": "runs", "job": "jobs"}.get(entity_type)
+    if table is None:
+        return None
+    return conn.execute(f"SELECT * FROM {table} WHERE id = ?", (entity_id,)).fetchone()
+
+
 def _check_artifact_local_drift(conn: sqlite3.Connection, options: DoctorOptions) -> list[DoctorIssue]:
     issues: list[DoctorIssue] = []
     for row in drifted_artifacts(conn, cwd=options.cwd, limit=1_000_000):
@@ -1294,6 +1410,13 @@ DOCTOR_CHECKS: dict[str, DoctorCheck] = {
         default_enabled=True,
         severity="warning",
         runner=_check_stale_sessions,
+    ),
+    "leases": DoctorCheck(
+        id="leases",
+        description="Detect stale, expired, orphaned, and archived advisory leases.",
+        default_enabled=True,
+        severity="warning",
+        runner=_check_leases,
     ),
     "ledger-locality": DoctorCheck(
         id="ledger-locality",

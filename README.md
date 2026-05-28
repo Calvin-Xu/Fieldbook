@@ -267,7 +267,7 @@ uv run fieldbook experiment triage "$EXP_ID" --json
 `workloop` is the preferred one-command active-experiment resume surface for
 agents. It combines locality, session state, run/datapoint progress, jobs,
 validations, freshness, scoped doctor issues, and suggested next commands
-without refreshing, checkpointing, cleaning up, launching, or monitoring unless
+without refreshing, writing handoffs, cleaning up, launching, or monitoring unless
 you pass explicit flags. `status` is the lower-level compact navigation surface
 for counts and previews. `context` is the LLM-ready Markdown handoff surface
 with full bodies for active handoff, next-action, and debug notes plus recent
@@ -339,8 +339,43 @@ uv run fieldbook dashboard serve --host 127.0.0.1 --port 8765
 ```
 
 The dashboard binds to `127.0.0.1:8765` by default, reads only stable `_v1`
-views, and exposes copyable Fieldbook commands or external links instead of
-write actions. Use the CLI or a coding agent for all mutations.
+views, and exposes copyable agent instruction cards or external links instead
+of write actions. It does not send prompts to agents, invoke coding agents, run
+CLI commands, or mutate the ledger. The human copies an instruction into an
+ongoing coding-agent session; the agent then uses the Fieldbook skill and CLI
+for any follow-up work.
+
+The dashboard groups experiments by rule-derived agent lifecycle:
+
+- `Needs attention`: blocking failures, failing validations, stale submissions,
+  or stale advisory leases need an agent to act.
+- `In progress`: running/submitting work, active leases, or recovery attempts
+  are still underway.
+- `Review`: new terminal jobs, artifacts, validations, or substantive notes
+  are newer than the latest review marker.
+- `Open`: no current action is required, but the experiment is intentionally
+  resumable later.
+- `Archived`: intentionally closed historical work.
+
+After reviewing outputs, record the review explicitly:
+
+```bash
+uv run fieldbook experiment mark-reviewed "$EXP_ID" \
+  --body-file /tmp/fieldbook-review.md \
+  --json
+```
+
+Review markers are `review` notes. They move an experiment from `Review` to
+`Open` only until newer reviewable activity is recorded. Handoff freshness is
+shown as metadata, not as a lifecycle bucket.
+
+Agents can inspect the same closed prompt catalog from the CLI:
+
+```bash
+uv run fieldbook prompt list --json
+uv run fieldbook prompt actions "$EXP_ID" --json
+uv run fieldbook prompt build resolve-failed-jobs "$EXP_ID" --json
+```
 
 For multiline Markdown notes, prefer a body file:
 
@@ -364,16 +399,16 @@ uv run fieldbook note add \
 uv run fieldbook note show "$NOTE_ID" --json
 ```
 
-Before context switching or archiving, write a checkpoint. Checkpoints are
+Before context switching or archiving, write a handoff. Handoffs are
 Markdown notes that include a generated freshness summary. Archived experiments
 are closed by default; use `--errata` only for explicit post-archive evidence.
 
 ```bash
-uv run fieldbook experiment checkpoint "$EXP_ID" \
-  --body-file /tmp/fieldbook-checkpoint.md \
+uv run fieldbook experiment handoff "$EXP_ID" \
+  --body-file /tmp/fieldbook-handoff.md \
   --json
 
-uv run fieldbook experiment checkpoint "$EXP_ID" \
+uv run fieldbook experiment handoff "$EXP_ID" \
   --archive \
   --json
 

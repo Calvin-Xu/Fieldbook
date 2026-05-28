@@ -1,4 +1,5 @@
 import http.client
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -70,17 +71,144 @@ def test_dashboard_empty_active_and_archived_rendering(tmp_path: Path) -> None:
     ledger = init_ledger(tmp_path)
     empty = render_experiment_index(ledger)
     assert "No experiments recorded yet" in empty
-    assert "fieldbook experiment create" in empty
 
     active_id = create_experiment(ledger)
     archived_id = payload(run_fieldbook(ledger, "experiment", "create", "--name", "archived"))["id"]
     payload(run_fieldbook(ledger, "experiment", "archive", archived_id))
 
     index = render_experiment_index(ledger)
-    assert "Active" in index
+    assert "Open" in index
     assert "Archived" in index
     assert active_id in index
     assert archived_id in index
+
+
+def test_dashboard_experiment_summary_deduplicates_two_path_jobs(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    first_experiment = create_experiment(ledger)
+    second_experiment = payload(run_fieldbook(ledger, "experiment", "create", "--name", "second"))["id"]
+    run_id = create_run(ledger, first_experiment)
+    job = payload(run_fieldbook(ledger, "job", "add", "--run", run_id, "--name", "train", "--status", "failed"))
+
+    with sqlite3.connect(ledger) as conn:
+        conn.row_factory = sqlite3.Row
+        created_at = conn.execute("SELECT created_at FROM experiment_runs WHERE experiment_id = ?", (first_experiment,)).fetchone()[0]
+        conn.execute("UPDATE jobs SET experiment_id = ? WHERE id = ?", (first_experiment, job["id"]))
+        conn.execute(
+            "INSERT INTO experiment_runs (experiment_id, run_id, created_at) VALUES (?, ?, ?)",
+            (second_experiment, run_id, created_at),
+        )
+        rows = {
+            row["experiment_id"]: dict(row)
+            for row in conn.execute(
+                "SELECT experiment_id, job_count, failed_job_count FROM v_dashboard_experiments_v1 "
+                "WHERE experiment_id IN (?, ?)",
+                (first_experiment, second_experiment),
+            )
+        }
+
+    assert rows[first_experiment]["job_count"] == 1
+    assert rows[first_experiment]["failed_job_count"] == 1
+    assert rows[second_experiment]["job_count"] == 1
+    assert rows[second_experiment]["failed_job_count"] == 1
+
+
+def test_dashboard_experiment_summary_avoids_join_explosion_plan(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    experiment_id = create_experiment(ledger)
+    run_id = create_run(ledger, experiment_id)
+    payload(run_fieldbook(ledger, "job", "add", "--run", run_id, "--name", "train", "--status", "failed"))
+    payload(
+        run_fieldbook(
+            ledger,
+            "note",
+            "add",
+            "--entity-type",
+            "experiment",
+            "--entity-id",
+            experiment_id,
+            "--type",
+            "checkpoint",
+            "--body",
+            "checkpoint",
+        )
+    )
+
+    with sqlite3.connect(ledger) as conn:
+        plan = "\n".join(
+            row[3]
+            for row in conn.execute(
+                "EXPLAIN QUERY PLAN SELECT * FROM v_dashboard_experiments_v1 ORDER BY updated_at DESC, experiment_id"
+            )
+        )
+
+    assert "SCAN j LEFT-JOIN" not in plan
+
+
+def test_dashboard_attention_uses_agent_actionability_not_historical_failures(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    recovered_id = payload(run_fieldbook(ledger, "experiment", "create", "--name", "recovered-history"))["id"]
+    recovered_run = create_run(ledger, recovered_id)
+    recovered_failed = payload(
+        run_fieldbook(ledger, "job", "add", "--run", recovered_run, "--name", "old-failure", "--status", "failed")
+    )
+    payload(
+        run_fieldbook(
+            ledger,
+            "job",
+            "add",
+            "--run",
+            recovered_run,
+            "--name",
+            "successful-retry",
+            "--status",
+            "succeeded",
+            "--retry-of",
+            recovered_failed["id"],
+        )
+    )
+    payload(
+        run_fieldbook(
+            ledger,
+            "note",
+            "add",
+            "--entity-type",
+            "experiment",
+            "--entity-id",
+            recovered_id,
+            "--type",
+            "checkpoint",
+            "--body",
+            "Recovered and ready.",
+        )
+    )
+
+    blocking_id = payload(run_fieldbook(ledger, "experiment", "create", "--name", "blocking-failure"))["id"]
+    blocking_run = payload(
+        run_fieldbook(
+            ledger,
+            "run",
+            "add",
+            "--name",
+            "blocking-run",
+            "--experiment",
+            blocking_id,
+            "--external-system",
+            "wandb",
+            "--external-id",
+            "blocking-run",
+        )
+    )["id"]
+    payload(run_fieldbook(ledger, "job", "add", "--run", blocking_run, "--name", "needs-retry", "--status", "failed"))
+
+    html = render_experiment_index(ledger)
+    needs_attention = html.split("id='needs-attention'", 1)[1].split("</section>", 1)[0]
+    review = html.split("id='review'", 1)[1].split("</section>", 1)[0]
+
+    assert "blocking-failure" in needs_attention
+    assert "recovered-history" not in needs_attention
+    assert "recovered-history" in review
+    assert "blocking failed" in html.lower()
 
 
 def test_dashboard_detail_sections_commands_and_external_links(tmp_path: Path) -> None:
@@ -146,7 +274,7 @@ def test_dashboard_detail_sections_commands_and_external_links(tmp_path: Path) -
         )
     )
 
-    detail = render_experiment_detail(ledger, experiment_id)
+    detail = render_experiment_detail(ledger, experiment_id, tab="overview")
     for section in (
         "Run Progress",
         "Job Recovery",
@@ -158,10 +286,16 @@ def test_dashboard_detail_sections_commands_and_external_links(tmp_path: Path) -
         "External Links",
     ):
         assert section in detail
+    assert "tab=runs" in detail
+    assert "tab=jobs" in detail
+    assert "Agent Instructions" in detail
+    assert "Preview agent instruction" in detail
     assert "fieldbook experiment workloop" in detail
-    assert "fieldbook refresh run" in detail
-    assert "https://iris.local/jobs/123" in detail
-    assert "https://example.com/report" in detail
+    assert "fieldbook refresh run" not in detail
+    external_links = render_experiment_detail(ledger, experiment_id, tab="external-links")
+    artifacts = render_experiment_detail(ledger, experiment_id, tab="artifacts")
+    assert "https://iris.local/jobs/123" in external_links
+    assert "https://example.com/report" in artifacts
 
 
 def test_dashboard_http_roundtrip_get_only_contract(tmp_path: Path) -> None:
@@ -212,4 +346,4 @@ def test_docs_and_skill_describe_read_only_dashboard() -> None:
     assert "uv run fieldbook dashboard serve --json" in readme
     assert "reads only stable `_v1`" in readme
     assert "Use the dashboard only as a read-only human scan surface" in skill
-    assert "It has no write routes" in skill
+    assert "does not send prompts" in skill

@@ -153,8 +153,11 @@ def experiment_freshness(
         "drifted_artifact_count": len(drifted_artifacts(conn, experiment_id=experiment_id, cwd=cwd, limit=1_000_000)),
         "stale_validation_count": len(stale_validations(conn, experiment_id=experiment_id, cwd=cwd, limit=1_000_000)),
         "last_checkpoint_at": last_checkpoint_at,
+        "last_handoff_at": last_checkpoint_at,
         "since_last_checkpoint_hours": since_hours,
+        "since_last_handoff_hours": since_hours,
         "checkpoint_status": checkpoint_status,
+        "handoff_status": checkpoint_status,
         "drifted_artifacts": drifted,
         "stale_validations": stale,
     }

@@ -77,7 +77,7 @@ uv run fieldbook experiment triage "$EXP_ID" --json
 Use `workloop` as the preferred bounded resume surface. It includes locality,
 session state, run/datapoint progress, jobs, validations, freshness, scoped
 doctor issues, and suggested next commands without launching, monitoring,
-refreshing, checkpointing, or cleanup unless explicit flags are passed. Use
+refreshing, writing handoffs, or cleanup unless explicit flags are passed. Use
 `context` for full Markdown note bodies. Then inspect only the relevant
 entities:
 
@@ -88,15 +88,15 @@ uv run fieldbook note list --entity-type experiment --entity-id "$EXP_ID" --stat
 uv run fieldbook note show "$NOTE_ID" --json
 ```
 
-Before leaving an experiment, write a checkpoint:
+Before leaving an experiment, write a handoff:
 
 ```bash
-uv run fieldbook experiment checkpoint "$EXP_ID" --body-file /tmp/checkpoint.md --json
+uv run fieldbook experiment handoff "$EXP_ID" --body-file /tmp/handoff.md --json
 ```
 
-Use `--archive` when the checkpoint should close the experiment. Archived
+Use `--archive` when the handoff should close the experiment. Archived
 experiments reject normal writes; use `--errata` only for explicit
-post-archive notes, artifacts, validations, or checkpoints. Errata rows are
+post-archive notes, artifacts, validations, or handoffs. Errata rows are
 visible in status/context under historical evidence and do not reactivate the
 experiment.
 
@@ -181,9 +181,40 @@ Use the dashboard only as a read-only human scan surface:
 uv run fieldbook dashboard serve --json
 ```
 
-The dashboard reads stable `_v1` views and shows copyable commands or external
-links. It has no write routes; run mutations through Fieldbook CLI/reconcile
-paths from the coding agent.
+The dashboard reads stable `_v1` views and shows copyable agent instructions or
+external links. Treat each dashboard prompt card as a human-to-agent handoff:
+the user may paste it into the current session, but the dashboard does not send
+prompts, call agents, run commands, or mutate the ledger. Use the Fieldbook
+skill for workflow practice rather than relying on the dashboard prompt as a
+full procedure.
+It has no write routes and does not send prompts.
+
+Dashboard lifecycle buckets are rule-derived from the ledger:
+
+- `Needs attention`: blocking failures, failing validations, stale submissions,
+  or stale advisory leases need action.
+- `In progress`: jobs, submissions, leases, or recovery work are underway.
+- `Review`: new outputs or evidence are newer than the latest review marker.
+- `Open`: no current action is required, but work may be resumed later.
+- `Archived`: intentionally closed historical work.
+
+After reviewing current outputs, record that explicitly:
+
+```bash
+uv run fieldbook experiment mark-reviewed "$EXP_ID" --body-file /tmp/review.md --json
+```
+
+Do not archive merely because work is dormant. Use `Open` for dormant work that
+might be resumed; use `Archived` only when the experiment is intentionally
+closed. Handoff freshness remains a badge/detail, not a lifecycle bucket.
+
+Useful read-only prompt commands:
+
+```bash
+uv run fieldbook prompt list --json
+uv run fieldbook prompt actions "$EXP_ID" --json
+uv run fieldbook prompt build refresh-external-state "$EXP_ID" --json
+```
 
 ## Record Work
 

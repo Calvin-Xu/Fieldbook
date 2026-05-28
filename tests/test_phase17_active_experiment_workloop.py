@@ -69,8 +69,8 @@ def test_workloop_json_markdown_and_read_only_default(tmp_path: Path) -> None:
 def test_workloop_checkpoint_body_sources_and_validation(tmp_path: Path) -> None:
     ledger = init_ledger(tmp_path)
     experiment_id = create_experiment(ledger)
-    body_file = tmp_path / "checkpoint.md"
-    body_file.write_text("Manual checkpoint body.\n", encoding="utf-8")
+    body_file = tmp_path / "handoff.md"
+    body_file.write_text("Manual handoff body.\n", encoding="utf-8")
 
     missing_checkpoint = run_fieldbook(
         ledger,
@@ -89,14 +89,14 @@ def test_workloop_checkpoint_body_sources_and_validation(tmp_path: Path) -> None
             "experiment",
             "workloop",
             experiment_id,
-            "--checkpoint",
+            "--handoff",
             "--body-file",
             str(body_file),
         )
     )
-    assert workloop["checkpoint"]["note"]["note_type"] == "checkpoint"
-    assert "Manual checkpoint body." in workloop["checkpoint"]["note"]["body"]
-    assert "## Freshness" in workloop["checkpoint"]["note"]["body"]
+    assert workloop["handoff"]["note"]["note_type"] == "checkpoint"
+    assert "Manual handoff body." in workloop["handoff"]["note"]["body"]
+    assert "## Freshness" in workloop["handoff"]["note"]["body"]
 
 
 def test_workloop_refresh_dry_run_apply_and_all_source_request(tmp_path: Path) -> None:
@@ -338,7 +338,7 @@ def test_workloop_checkpoint_rejects_archived_before_refresh_apply(tmp_path: Pat
         "--refresh",
         "iris_jobs",
         "--apply",
-        "--checkpoint",
+        "--handoff",
         check=False,
     )
     assert rejected.returncode == ExitCode.VALIDATION_ERROR

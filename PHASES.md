@@ -25,6 +25,8 @@ files.
 | 17 | `active-experiment-workloop` | `tests/test_phase17_active_experiment_workloop.py` | Agent-facing active-experiment workloop, scoped health, and low-friction refresh/checkpoint discipline. |
 | 18 | `advisory-leases-and-monitors` | `tests/test_phase18_advisory_leases_monitors.py` | Advisory ownership leases for agent babysitting, monitor handoffs, and multi-agent coordination. |
 | 19 | `dashboard-mvp` | `tests/test_phase19_dashboard_mvp.py` | Read-only local dashboard over stable views for active experiment status and coordination state. |
+| 20 | `dashboard-agent-prompts` | `tests/test_phase20_dashboard_agent_prompts.py` | Schema-aware dashboard UI and copyable agent-instruction prompt builders. |
+| 21 | `dashboard-agent-lifecycle-buckets` | `tests/test_phase21_dashboard_lifecycle.py` | Rule-derived agent lifecycle buckets, review markers, and handoff freshness badges. |
 
 ## Numbering Rules
 

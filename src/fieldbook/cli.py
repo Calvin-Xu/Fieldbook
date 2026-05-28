@@ -28,6 +28,7 @@ from fieldbook.ledger_resolution import (
 )
 from fieldbook.output import emit
 from fieldbook.doctor import doctor_failed, format_doctor_text, list_doctor_checks, run_doctor
+from fieldbook.prompts import build_prompt, prompt_actions, prompt_catalog
 from fieldbook.repository import Repository, note_body_preview
 from fieldbook.reconcile import load_manifest, reconcile_log, reconcile_manifest
 from fieldbook.refresh import list_refresh_sources, refresh_log, run_refresh
@@ -100,6 +101,8 @@ def _is_read_only(args: argparse.Namespace) -> bool:
         )
     if command == "refresh":
         return getattr(args, "refresh_command", None) in {"list-sources", "log"}
+    if command == "prompt":
+        return True
     if command in {"db", "sql"}:
         return True
     if command == "session":
@@ -168,9 +171,43 @@ def _cmd_dashboard_serve(args: argparse.Namespace) -> int:
     if args.dry_run:
         emit(payload, json_output=args.json)
         return ExitCode.SUCCESS
+    connect(ledger_path).close()
     if args.json:
         emit(payload, json_output=True)
     serve_dashboard(ledger_path, host=config["host"], port=config["port"], announce=not args.json)
+    return ExitCode.SUCCESS
+
+
+def _cmd_prompt_list(args: argparse.Namespace) -> int:
+    payload = prompt_catalog()
+    emit(payload, json_output=args.json, text=_format_prompt_catalog(payload))
+    return ExitCode.SUCCESS
+
+
+def _cmd_prompt_actions(args: argparse.Namespace) -> int:
+    ledger_path = discover_ledger(ledger=args.ledger)
+    conn = connect(ledger_path, allow_newer_readonly=True)
+    try:
+        payload = prompt_actions(conn, args.experiment)
+    finally:
+        conn.close()
+    emit(payload, json_output=args.json, text=_format_prompt_actions(payload))
+    return ExitCode.SUCCESS
+
+
+def _cmd_prompt_build(args: argparse.Namespace) -> int:
+    ledger_path = discover_ledger(ledger=args.ledger)
+    conn = connect(ledger_path, allow_newer_readonly=True)
+    try:
+        payload = build_prompt(
+            conn,
+            args.action,
+            args.experiment,
+            skill_path=Path(__file__).resolve().parents[2] / ".codex" / "skills" / "fieldbook" / "SKILL.md",
+        )
+    finally:
+        conn.close()
+    emit(payload, json_output=args.json, text=payload["body"])
     return ExitCode.SUCCESS
 
 
@@ -205,22 +242,23 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def _cmd_experiment_workloop(args: argparse.Namespace) -> int:
-    if not args.checkpoint and (args.body is not None or args.body_file is not None or args.body_stdin):
-        raise ValidationError("workloop body sources require --checkpoint")
+    write_handoff = args.handoff or args.checkpoint
+    if not write_handoff and (args.body is not None or args.body_file is not None or args.body_stdin):
+        raise ValidationError("workloop body sources require --handoff")
     if args.refresh and args.refresh_all:
         raise ValidationError("workloop refresh requires --refresh or --refresh-all, not both")
     resolution = resolve_ledger_location(ledger=args.ledger)
     ledger_path = resolution.path
     if ledger_path is None:
         raise NotFoundError("Fieldbook ledger not found; run `fieldbook init` first")
-    needs_write = args.checkpoint or args.apply or bool(args.refresh) or args.refresh_all
+    needs_write = write_handoff or args.apply or bool(args.refresh) or args.refresh_all
     conn = connect(ledger_path, allow_newer_readonly=not needs_write)
     try:
         session_id, session_source, marker_status = _resolved_session_id(resolution)
         repo = Repository(conn, current_session_id=session_id)
         experiment = repo.get_experiment(args.experiment)
-        if args.checkpoint and experiment["deleted_at"] is not None:
-            raise ValidationError("workloop checkpoint requires an active experiment")
+        if write_handoff and experiment["deleted_at"] is not None:
+            raise ValidationError("workloop handoff requires an active experiment")
         source_names: list[str] = []
         refresh_payload = None
         if args.refresh or args.refresh_all:
@@ -266,15 +304,15 @@ def _cmd_experiment_workloop(args: argparse.Namespace) -> int:
                 "sources": source_names,
                 "apply": args.apply,
             }
-        if args.checkpoint:
-            checkpoint = repo.checkpoint_experiment(
+        if write_handoff:
+            handoff = repo.checkpoint_experiment(
                 experiment["id"],
                 body=_resolve_optional_body(args),
                 archive=False,
                 errata=False,
                 stale_hours=args.stale_hours,
             )
-            payload["checkpoint"] = checkpoint
+            payload["handoff"] = handoff
     finally:
         conn.close()
     emit(payload, json_output=args.json, text=_format_workloop_markdown(payload))
@@ -571,11 +609,11 @@ def _workloop_suggested_actions(*, status: dict[str, Any], doctor: dict[str, Any
                 "command": f"fieldbook doctor --experiment {experiment_id} --json",
             }
         )
-    if status["freshness"].get("checkpoint_status") in {"missing", "stale"}:
+    if status["freshness"].get("handoff_status") in {"missing", "stale"}:
         actions.append(
             {
-                "label": "Write experiment checkpoint",
-                "command": f"fieldbook experiment workloop {experiment_id} --checkpoint --body-file <handoff.md> --json",
+                "label": "Write experiment handoff",
+                "command": f"fieldbook experiment workloop {experiment_id} --handoff --body-file <handoff.md> --json",
             }
         )
     if status.get("leases", {}).get("stale_count", 0) or status.get("leases", {}).get("expired_count", 0):
@@ -607,7 +645,7 @@ def _format_workloop_markdown(payload: dict[str, Any]) -> str:
         f"- Stale leases: `{payload['leases']['stale_count']}`",
         f"- Doctor issues: `{payload['doctor']['scoped_issue_count']}`",
         f"- Omitted global issues: `{payload['doctor']['global_omitted_count']}`",
-        f"- Checkpoint status: `{payload['freshness'].get('checkpoint_status')}`",
+        f"- Handoff status: `{payload['freshness'].get('handoff_status')}`",
         "",
         "## Suggested Next Actions",
         "",
@@ -696,6 +734,20 @@ def _experiment_checkpoint(args: argparse.Namespace, repo: Repository) -> dict[s
         errata=args.errata,
         stale_hours=args.stale_hours,
     )
+
+
+def _experiment_handoff(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.checkpoint_experiment(
+        args.experiment,
+        body=_resolve_optional_body(args),
+        archive=args.archive,
+        errata=args.errata,
+        stale_hours=args.stale_hours,
+    )
+
+
+def _experiment_mark_reviewed(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
+    return repo.mark_experiment_reviewed(args.experiment, body=_resolve_optional_body(args))
 
 
 def _experiment_cleanup(args: argparse.Namespace, repo: Repository) -> dict[str, Any]:
@@ -1407,6 +1459,23 @@ def _format_note_list(notes: list[dict[str, Any]]) -> str:
     return "\n\n".join(blocks)
 
 
+def _format_prompt_catalog(payload: dict[str, Any]) -> str:
+    lines = [f"Fieldbook prompt catalog: {payload['catalog_version']}"]
+    for action in payload["actions"]:
+        lines.append(f"- {action['action_id']}: {action['title']}")
+    return "\n".join(lines)
+
+
+def _format_prompt_actions(payload: dict[str, Any]) -> str:
+    lines = [f"Applicable prompt actions for {payload['experiment_name']} ({payload['experiment_id']}):"]
+    if not payload["actions"]:
+        lines.append("(none)")
+        return "\n".join(lines)
+    for action in payload["actions"]:
+        lines.append(f"- {action['action_id']}: {action['issue_summary']}")
+    return "\n".join(lines)
+
+
 def _session_context_fields(resolution: LedgerResolution) -> dict[str, str | None]:
     commit, _dirty = current_git_revision(resolution.cwd)
     return {
@@ -1490,6 +1559,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_snapshot_parsers(subparsers)
     _add_db_parsers(subparsers)
     _add_sql_parser(subparsers)
+    _add_prompt_parsers(subparsers)
     _add_dashboard_parser(subparsers)
     return parser
 
@@ -1605,7 +1675,8 @@ def _add_experiment_parsers(subparsers: argparse._SubParsersAction) -> None:
     workloop.add_argument("--refresh-all", action="store_true")
     workloop.add_argument("--config")
     workloop.add_argument("--apply", action="store_true")
-    workloop.add_argument("--checkpoint", action="store_true")
+    workloop.add_argument("--handoff", action="store_true")
+    workloop.add_argument("--checkpoint", action="store_true", help=argparse.SUPPRESS)
     workloop_body_group = workloop.add_mutually_exclusive_group()
     workloop_body_group.add_argument("--body")
     workloop_body_group.add_argument("--body-file")
@@ -1629,13 +1700,34 @@ def _add_experiment_parsers(subparsers: argparse._SubParsersAction) -> None:
     archive.add_argument("experiment")
     archive.set_defaults(func=_repo_command(_experiment_archive))
 
-    checkpoint = commands.add_parser("checkpoint")
+    mark_reviewed = commands.add_parser("mark-reviewed")
+    _common_repo_parser(mark_reviewed)
+    mark_reviewed.add_argument("experiment")
+    mark_reviewed_body_group = mark_reviewed.add_mutually_exclusive_group()
+    mark_reviewed_body_group.add_argument("--body")
+    mark_reviewed_body_group.add_argument("--body-file")
+    mark_reviewed_body_group.add_argument("--body-stdin", action="store_true")
+    mark_reviewed.set_defaults(func=_repo_command(_experiment_mark_reviewed))
+
+    handoff = commands.add_parser("handoff")
+    _common_repo_parser(handoff)
+    handoff.add_argument("experiment")
+    handoff_body_group = handoff.add_mutually_exclusive_group()
+    handoff_body_group.add_argument("--body")
+    handoff_body_group.add_argument("--body-file")
+    handoff_body_group.add_argument("--body-stdin", action="store_true")
+    handoff.add_argument("--archive", action="store_true")
+    handoff.add_argument("--errata", action="store_true")
+    handoff.add_argument("--stale-hours", type=float, default=24.0)
+    handoff.set_defaults(func=_repo_command(_experiment_handoff))
+
+    checkpoint = commands.add_parser("checkpoint", help=argparse.SUPPRESS)
     _common_repo_parser(checkpoint)
     checkpoint.add_argument("experiment")
-    body_group = checkpoint.add_mutually_exclusive_group()
-    body_group.add_argument("--body")
-    body_group.add_argument("--body-file")
-    body_group.add_argument("--body-stdin", action="store_true")
+    checkpoint_body_group = checkpoint.add_mutually_exclusive_group()
+    checkpoint_body_group.add_argument("--body")
+    checkpoint_body_group.add_argument("--body-file")
+    checkpoint_body_group.add_argument("--body-stdin", action="store_true")
     checkpoint.add_argument("--archive", action="store_true")
     checkpoint.add_argument("--errata", action="store_true")
     checkpoint.add_argument("--stale-hours", type=float, default=24.0)
@@ -2122,6 +2214,26 @@ def _add_dashboard_parser(subparsers: argparse._SubParsersAction) -> None:
     serve.add_argument("--allow-non-localhost", action="store_true")
     serve.add_argument("--dry-run", action="store_true")
     serve.set_defaults(func=_cmd_dashboard_serve)
+
+
+def _add_prompt_parsers(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("prompt", help="Build bounded dashboard agent instructions")
+    commands = parser.add_subparsers(dest="prompt_command", required=True)
+
+    list_parser = commands.add_parser("list")
+    _add_common_options(list_parser)
+    list_parser.set_defaults(func=_cmd_prompt_list)
+
+    actions = commands.add_parser("actions")
+    _add_common_options(actions)
+    actions.add_argument("experiment")
+    actions.set_defaults(func=_cmd_prompt_actions)
+
+    build = commands.add_parser("build")
+    _add_common_options(build)
+    build.add_argument("action")
+    build.add_argument("experiment")
+    build.set_defaults(func=_cmd_prompt_build)
 
 
 def _add_export_parsers(subparsers: argparse._SubParsersAction) -> None:

@@ -138,7 +138,7 @@ class Repository:
             entity_ref=experiment["id"],
             note_type="checkpoint",
             status="open",
-            title="Experiment checkpoint",
+            title="Experiment handoff",
             body=note_body,
             body_format="markdown",
             author=None,
@@ -153,6 +153,39 @@ class Repository:
             "experiment": experiment,
             "note": note,
             "freshness": freshness,
+        }
+
+    def mark_experiment_reviewed(self, ref: str, *, body: str | None) -> dict[str, Any]:
+        experiment = self.get_experiment(ref)
+        dashboard_row = self.conn.execute(
+            "SELECT reviewable_activity_count, last_reviewable_activity_key "
+            "FROM v_dashboard_experiments_v1 WHERE experiment_id = ?",
+            (experiment["id"],),
+        ).fetchone()
+        reviewed_at = utc_now()
+        note = self.add_note(
+            entity_type="experiment",
+            entity_ref=experiment["id"],
+            note_type="review",
+            status="resolved",
+            title="Experiment reviewed",
+            body=body or "Reviewed current Fieldbook experiment outputs.",
+            body_format="markdown",
+            author=None,
+            attrs={
+                "fieldbook.review": True,
+                "fieldbook.reviewed_at": reviewed_at,
+                "fieldbook.reviewed_activity_count": int(dashboard_row["reviewable_activity_count"] or 0)
+                if dashboard_row is not None
+                else 0,
+                "fieldbook.reviewed_activity_key": dashboard_row["last_reviewable_activity_key"]
+                if dashboard_row is not None
+                else None,
+            },
+        )
+        return {
+            "experiment": self.get_experiment(experiment["id"]),
+            "note": note,
         }
 
     def experiment_status(
@@ -1901,12 +1934,12 @@ class Repository:
         if body:
             lines.extend([body.rstrip(), ""])
         else:
-            lines.extend(["# Experiment Checkpoint", ""])
+            lines.extend(["# Experiment Handoff", ""])
         lines.extend(
             [
                 "## Freshness",
                 "",
-                f"- Checkpoint status: `{freshness['checkpoint_status']}`",
+                f"- Handoff status: `{freshness['handoff_status']}`",
                 f"- Drifted artifacts: {freshness['drifted_artifact_count']}",
                 f"- Stale validations: {freshness['stale_validation_count']}",
             ]

@@ -961,7 +961,7 @@ def _check_experiment_checkpoint_stale(conn: sqlite3.Connection, options: Doctor
             cwd=options.cwd,
             stale_checkpoint_hours=options.stale_hours,
         )
-        if freshness["checkpoint_status"] not in {"missing", "stale"}:
+        if freshness["handoff_status"] not in {"missing", "stale"}:
             continue
         issues.append(
             DoctorIssue(
@@ -969,14 +969,14 @@ def _check_experiment_checkpoint_stale(conn: sqlite3.Connection, options: Doctor
                 severity="warning",
                 entity_type="experiment",
                 entity_id=row["id"],
-                message="experiment has activity without a current checkpoint",
+                message="experiment has activity without a current handoff",
                 details={
                     "name": row["name"],
-                    "checkpoint_status": freshness["checkpoint_status"],
-                    "last_checkpoint_at": freshness["last_checkpoint_at"],
-                    "since_last_checkpoint_hours": freshness["since_last_checkpoint_hours"],
+                    "handoff_status": freshness["handoff_status"],
+                    "last_handoff_at": freshness["last_handoff_at"],
+                    "since_last_handoff_hours": freshness["since_last_handoff_hours"],
                 },
-                suggested_next_action="Run `fieldbook experiment checkpoint` before context switching or archiving.",
+                suggested_next_action="Run `fieldbook experiment handoff` before context switching or archiving.",
             )
         )
     return issues
@@ -1469,7 +1469,7 @@ DOCTOR_CHECKS: dict[str, DoctorCheck] = {
     ),
     "experiment.checkpoint_stale": DoctorCheck(
         id="experiment.checkpoint_stale",
-        description="Detect active experiments without a current checkpoint.",
+        description="Detect active experiments without a current handoff.",
         default_enabled=True,
         severity="warning",
         runner=_check_experiment_checkpoint_stale,

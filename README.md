@@ -14,6 +14,25 @@ record jobs, refresh state, preserve provenance, export tables, and recover
 context after switching experiments. Humans can run the CLI directly, but the
 CLI and outputs are optimized for agents.
 
+## AI Tool Usage
+
+This project is built primarily with Codex as the coding agent. The human
+researcher provides product direction, acceptance criteria, and review; Codex
+drafts OpenSpec changes, implements migrations and CLI/dashboard code, writes
+tests, updates documentation, and dogfoods the workflow against real experiment
+state.
+
+Claude Code is used as an independent reviewer for design, OpenSpec changes,
+implementation reviews, and presentation/storyboard critique. Reviews are run
+in read-only or narrowly scoped modes where possible, and review feedback is
+patched before phases are treated as complete.
+
+OpenSpec is used to structure the staged Fieldbook buildout and preserve the
+intent of each phase. The main dogfood environment is the Marin repository and
+its Iris/W&B/GCS-backed ML experiment workflow; Fieldbook itself remains a
+portable sidecar tool and does not require downstream projects to add it as a
+Python dependency.
+
 ## Motivation
 
 Modern ML research often has more live state than fits in one conversation:

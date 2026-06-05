@@ -14,6 +14,81 @@ record jobs, refresh state, preserve provenance, export tables, and recover
 context after switching experiments. Humans can run the CLI directly, but the
 CLI and outputs are optimized for agents.
 
+## Course Project Questions
+
+### Q1: Why did you build what you did?
+
+Modern ML research has become a context-switching problem. A single researcher
+may have several experiments live at once: one waiting on training, another on
+follow-up evals, another on artifact collection, and another on failed job
+recovery. Training systems, eval jobs, and coding agents can run in parallel,
+but the human interactive session is still mostly serial. The bottleneck is
+recovering enough operational context to decide what to trust and what to do
+next.
+
+Fieldbook was inspired by the operating-systems idea of thread context
+switching. When an experiment blocks on external work, the agent should save
+the relevant state, switch to another experiment, later refresh external state,
+and resume without reconstructing history from chat logs, terminal scrollback,
+experiment trackers, job dashboards, cloud storage, and Markdown notes.
+
+### Q2: How exactly does the product work?
+
+Fieldbook is primarily an application/product and automation/agent-systems
+artifact. It is not a model-training method; it is infrastructure for managing
+the operational state around model-training research.
+
+The core is a local SQLite ledger, usually stored at
+`.experiments/ledger.sqlite`, with explicit entities for experiments, runs,
+jobs, artifacts, metrics, notes, validations, sessions, leases, refreshes, and
+reconcile events. An experiment is a research thread. A run is an intended
+datapoint or result row. A job is an execution attempt that may fail, retry, or
+recover a run. Artifacts and metrics record evidence; Markdown notes preserve
+handoffs, decisions, and debug context.
+
+Coding agents use the CLI and JSON surfaces to enter an experiment workloop,
+inspect bounded status, refresh external systems, reconcile evidence, write
+handoffs, and resume work. The dashboard is read-only: it lets a human scan the
+ledger and copy an agent instruction, but mutations still happen through the
+CLI and reconcile paths.
+
+### Q3: Potential use cases of the product
+
+The broader impact is to make agent-assisted ML research more verifiable. As
+research groups rely more on coding agents to launch jobs, inspect failures,
+refresh results, and write handoffs, the evidence trail should become clearer
+rather than more opaque. Fieldbook helps preserve the connection between a
+research question, the runs that were intended, the jobs that actually ran, the
+artifacts and metrics that were collected, and the notes explaining decisions.
+
+This is valuable for society because scientific progress depends on trust,
+reproducibility, and negative results as much as successful demos. Experiment
+state should not live only in one person's chat history or terminal scrollback.
+A local, queryable ledger makes it easier to audit what was launched, what
+failed, what evidence was collected, and how a conclusion was reached.
+
+In practice, I envision researchers using Fieldbook for active experiment
+monitoring, retry/debug triage, context switching between research threads,
+collaborator handoffs, collaborator-ready exports, and multi-agent coordination
+inside any ML repo. Fieldbook has been dogfooded against real ML research
+workflows where a single research question can involve data generation,
+training jobs, eval jobs, experiment-tracker runs, cloud artifacts, dashboards,
+and retry history.
+
+### Q4: What more would you add?
+
+The next major product concept is to make hypotheses first-class entities
+above experiments. Today, experiments are the main organizing object. In a more
+scientific workflow, a hypothesis would preregister what we expect to happen,
+why it matters, and what evidence would validate or contradict it. Experiments
+would then be grouped under hypotheses and marked as validating,
+contradicting, or inconclusive.
+
+This fits open-lab research models: code, data, experiments, mistakes, and
+negative results should be visible and reproducible. As coding agents do more of
+the operational loop, Fieldbook should make scientific claims and evidence
+trails more explicit, not less.
+
 ## AI Tool Usage
 
 This project is built primarily with Codex as the coding agent. The human
@@ -28,10 +103,10 @@ in read-only or narrowly scoped modes where possible, and review feedback is
 patched before phases are treated as complete.
 
 OpenSpec is used to structure the staged Fieldbook buildout and preserve the
-intent of each phase. The main dogfood environment is the Marin repository and
-its Iris/W&B/GCS-backed ML experiment workflow; Fieldbook itself remains a
-portable sidecar tool and does not require downstream projects to add it as a
-Python dependency.
+intent of each phase. Fieldbook has been dogfooded against real ML experiment
+workflows with external job systems, experiment trackers, cloud artifacts, and
+analysis dashboards; Fieldbook itself remains a portable sidecar tool and does
+not require downstream projects to add it as a Python dependency.
 
 ## Motivation
 

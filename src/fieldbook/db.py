@@ -12,7 +12,30 @@ from fieldbook.ledger_resolution import (
 )
 
 
-CURRENT_SCHEMA_VERSION = 17
+CURRENT_SCHEMA_VERSION = 18
+
+
+def _available_migration_versions() -> list[int]:
+    versions: list[int] = []
+    for path in resources.files("fieldbook.migrations").iterdir():
+        if not path.name.endswith(".sql"):
+            continue
+        prefix = path.name.split("_", 1)[0]
+        if prefix.isdigit():
+            versions.append(int(prefix))
+    return sorted(versions)
+
+
+def _migration_versions() -> list[int]:
+    versions = _available_migration_versions()
+    if not versions:
+        raise RuntimeError("no Fieldbook SQL migrations were found")
+    latest = versions[-1]
+    if latest != CURRENT_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"latest Fieldbook SQL migration is {latest}, but CURRENT_SCHEMA_VERSION is {CURRENT_SCHEMA_VERSION}"
+        )
+    return versions
 
 
 def resolve_init_path(
@@ -96,7 +119,13 @@ def apply_migrations(conn: sqlite3.Connection, *, allow_newer_readonly: bool = F
             raise ValidationError(
                 f"ledger schema version {current} is newer than supported version {CURRENT_SCHEMA_VERSION}"
             )
-        for version in range(current + 1, CURRENT_SCHEMA_VERSION + 1):
+        migration_versions = _migration_versions()
+        if current != 0 and current < CURRENT_SCHEMA_VERSION and current not in migration_versions:
+            raise ValidationError(
+                f"ledger schema version {current} predates Fieldbook's coalesced migration baseline; "
+                f"upgrade it with a pre-coalescing Fieldbook version before using this release"
+            )
+        for version in [version for version in migration_versions if version > current]:
             _preflight_migration(conn, version)
             _execute_sql_script(conn, _migration_sql(version))
             conn.execute("PRAGMA user_version = %d" % version)

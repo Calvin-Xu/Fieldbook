@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from fieldbook.db import CURRENT_SCHEMA_VERSION, _execute_sql_script, _migration_sql
+from fieldbook.db import CURRENT_SCHEMA_VERSION
 from tests.test_phase2_cli import create_experiment, create_run, init_ledger, payload, run_fieldbook
 
 
@@ -991,23 +991,10 @@ def test_artifact_uri_collision_requires_update_existing(tmp_path):
     assert updated["content_hash"] == "sha256:" + "b" * 64
 
 
-def test_non_init_commands_apply_pending_migrations(tmp_path):
+def test_non_init_commands_apply_fresh_baseline_schema(tmp_path):
     ledger = tmp_path / "ledger.sqlite"
     ledger.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(ledger)
-    try:
-        conn.execute("BEGIN")
-        for version in range(1, CURRENT_SCHEMA_VERSION):
-            _execute_sql_script(conn, _migration_sql(version))
-            conn.execute(f"PRAGMA user_version = {version}")
-            conn.execute(
-                "INSERT OR REPLACE INTO schema_metadata (key, value, updated_at) "
-                "VALUES ('schema_version', ?, datetime('now'))",
-                (str(version),),
-            )
-        conn.commit()
-    finally:
-        conn.close()
+    sqlite3.connect(ledger).close()
 
     result = payload(run_fieldbook(ledger, "experiment", "list"))
     assert result == []

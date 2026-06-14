@@ -5,12 +5,12 @@ The dashboard SHALL group experiments by deterministic agent lifecycle buckets.
 
 #### Scenario: Lifecycle groups are ordered
 - **WHEN** the dashboard index is rendered
-- **THEN** experiments are grouped as `Needs attention`, `In progress`,
+- **THEN** experiments are grouped as `Needs attention`, `Running`,
   `Review`, `Open`, and `Archived`
 
 #### Scenario: Lifecycle tokens are canonical
 - **WHEN** stable dashboard views expose `lifecycle_state`
-- **THEN** values use `needs_attention`, `in_progress`, `review`, `open`, or
+- **THEN** values use `needs_attention`, `running`, `review`, `open`, or
   `archived`
 
 #### Scenario: Archived has highest precedence
@@ -23,14 +23,19 @@ The dashboard SHALL group experiments by deterministic agent lifecycle buckets.
   stale submissions, or stale advisory leases
 - **THEN** it is grouped under `Needs attention`
 
-#### Scenario: Running work is in progress
-- **WHEN** an active experiment has active jobs or recovery-in-progress failed
-  jobs and no higher-precedence actionable issue
-- **THEN** it is grouped under `In progress`
+#### Scenario: Live work is running
+- **WHEN** an active experiment has active jobs and no higher-precedence
+  actionable issue
+- **THEN** it is grouped under `Running`
+
+#### Scenario: Active lease alone is not running
+- **WHEN** an active experiment has active advisory leases but no active jobs
+  and no higher-precedence actionable issue
+- **THEN** it is not grouped under `Running`
 
 #### Scenario: Active work has precedence over review
 - **WHEN** an active experiment has active work and pending reviewable outputs
-- **THEN** it is grouped under `In progress` and exposes pending-review
+- **THEN** it is grouped under `Running` and exposes pending-review
   metadata separately
 
 #### Scenario: Reviewable outputs enter review

@@ -194,7 +194,7 @@ def _connect_readonly(ledger_path: Path) -> sqlite3.Connection:
 def _experiment_groups(conn: sqlite3.Connection) -> dict[str, list[dict[str, Any]]]:
     groups: dict[str, list[dict[str, Any]]] = {
         "Needs attention": [],
-        "In progress": [],
+        "Running": [],
         "Review": [],
         "Open": [],
         "Archived": [],
@@ -213,7 +213,7 @@ def _experiment_group(row: dict[str, Any]) -> str:
     lifecycle_state = row.get("lifecycle_state")
     labels = {
         "needs_attention": "Needs attention",
-        "in_progress": "In progress",
+        "running": "Running",
         "review": "Review",
         "open": "Open",
         "archived": "Archived",

@@ -1,4 +1,5 @@
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from fieldbook.dashboard import render_experiment_detail, render_experiment_index
@@ -11,9 +12,9 @@ def test_dashboard_lifecycle_groups_are_agent_actionable(tmp_path: Path) -> None
     attention_run = _run(ledger, attention_id, "attention-run")
     payload(run_fieldbook(ledger, "job", "add", "--run", attention_run, "--name", "failed", "--status", "failed"))
 
-    progress_id = _experiment(ledger, "progress")
-    progress_run = _run(ledger, progress_id, "progress-run")
-    payload(run_fieldbook(ledger, "job", "add", "--run", progress_run, "--name", "train", "--status", "running"))
+    running_id = _experiment(ledger, "running")
+    running_run = _run(ledger, running_id, "running-run")
+    payload(run_fieldbook(ledger, "job", "add", "--run", running_run, "--name", "train", "--status", "running"))
 
     review_id = _experiment(ledger, "review")
     review_run = _run(ledger, review_id, "review-run")
@@ -28,13 +29,14 @@ def test_dashboard_lifecycle_groups_are_agent_actionable(tmp_path: Path) -> None
     html = render_experiment_index(ledger)
     assert "Stale" not in html
     assert "Needs attention" in html
-    assert "In progress" in html
+    assert "Running" in html
+    assert "In progress" not in html
     assert "Review" in html
     assert "Open" in html
     assert "Archived" in html
 
     assert "attention" in _section(html, "needs-attention")
-    assert "progress" in _section(html, "in-progress")
+    assert "running" in _section(html, "running")
     assert "review" in _section(html, "review")
     assert "open" in _section(html, "open")
     assert "archived" in _section(html, "archived")
@@ -112,7 +114,131 @@ def test_active_work_has_precedence_over_pending_review(tmp_path: Path) -> None:
         conn.row_factory = sqlite3.Row
         row = _dashboard_row(conn, experiment_id)
         assert row["has_pending_review"] == 1
-        assert row["lifecycle_state"] == "in_progress"
+        assert row["lifecycle_state"] == "running"
+
+
+def test_active_lease_is_badge_not_running_bucket(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    experiment_id = _experiment(ledger, "claimed-idle")
+    payload(
+        run_fieldbook(
+            ledger,
+            "lease",
+            "claim",
+            "--entity-type",
+            "experiment",
+            "--entity-id",
+            experiment_id,
+            "--owner",
+            "agent-a",
+        )
+    )
+
+    with sqlite3.connect(ledger) as conn:
+        conn.row_factory = sqlite3.Row
+        row = _dashboard_row(conn, experiment_id)
+        assert row["active_lease_count"] == 1
+        assert row["lifecycle_state"] == "open"
+
+    html = render_experiment_index(ledger)
+    assert "claimed-idle" in _section(html, "open")
+    assert "claimed-idle" not in _section(html, "running")
+    assert "leases" in html
+
+
+def test_stale_lease_escalates_to_needs_attention(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    experiment_id = _experiment(ledger, "stale-lease")
+    lease = payload(
+        run_fieldbook(
+            ledger,
+            "lease",
+            "claim",
+            "--entity-type",
+            "experiment",
+            "--entity-id",
+            experiment_id,
+            "--owner",
+            "agent-a",
+        )
+    )["lease"]
+    _set_heartbeat(ledger, lease["id"], _ts(-3))
+
+    with sqlite3.connect(ledger) as conn:
+        conn.row_factory = sqlite3.Row
+        row = _dashboard_row(conn, experiment_id)
+        assert row["stale_lease_count"] == 1
+        assert row["lifecycle_state"] == "needs_attention"
+
+    html = render_experiment_index(ledger)
+    assert "stale-lease" in _section(html, "needs-attention")
+    assert "stale-lease" not in _section(html, "running")
+
+
+def test_recovery_with_active_retry_is_running(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    experiment_id = _experiment(ledger, "recovering")
+    run_id = _run(ledger, experiment_id, "recovering-run")
+    failed = payload(run_fieldbook(ledger, "job", "add", "--run", run_id, "--name", "failed", "--status", "failed"))
+    payload(
+        run_fieldbook(
+            ledger,
+            "job",
+            "add",
+            "--run",
+            run_id,
+            "--name",
+            "retry",
+            "--status",
+            "queued",
+            "--retry-of",
+            failed["id"],
+        )
+    )
+
+    with sqlite3.connect(ledger) as conn:
+        conn.row_factory = sqlite3.Row
+        row = _dashboard_row(conn, experiment_id)
+        assert row["active_job_count"] == 1
+        assert row["recovery_in_progress_failed_job_count"] == 1
+        assert row["lifecycle_state"] == "running"
+
+    html = render_experiment_index(ledger)
+    assert "recovering" in _section(html, "running")
+
+
+def test_failed_retry_without_active_descendant_is_not_running(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    experiment_id = _experiment(ledger, "terminal-retry")
+    run_id = _run(ledger, experiment_id, "terminal-retry-run")
+    failed = payload(run_fieldbook(ledger, "job", "add", "--run", run_id, "--name", "failed", "--status", "failed"))
+    payload(
+        run_fieldbook(
+            ledger,
+            "job",
+            "add",
+            "--run",
+            run_id,
+            "--name",
+            "retry-failed",
+            "--status",
+            "failed",
+            "--retry-of",
+            failed["id"],
+        )
+    )
+
+    with sqlite3.connect(ledger) as conn:
+        conn.row_factory = sqlite3.Row
+        row = _dashboard_row(conn, experiment_id)
+        assert row["active_job_count"] == 0
+        assert row["recovery_in_progress_failed_job_count"] == 0
+        assert row["blocking_failed_job_count"] > 0
+        assert row["lifecycle_state"] == "needs_attention"
+
+    html = render_experiment_index(ledger)
+    assert "terminal-retry" in _section(html, "needs-attention")
+    assert "terminal-retry" not in _section(html, "running")
 
 
 def test_docs_and_skill_explain_lifecycle_review_semantics() -> None:
@@ -122,7 +248,8 @@ def test_docs_and_skill_explain_lifecycle_review_semantics() -> None:
 
     for text in (readme, skill):
         assert "Needs attention" in text
-        assert "In progress" in text
+        assert "Running" in text
+        assert "In progress" not in text
         assert "Review" in text
         assert "Open" in text
         assert "fieldbook experiment mark-reviewed" in text
@@ -155,6 +282,15 @@ def _dashboard_row(conn: sqlite3.Connection, experiment_id: str) -> sqlite3.Row:
     row = conn.execute("SELECT * FROM v_dashboard_experiments_v1 WHERE experiment_id = ?", (experiment_id,)).fetchone()
     assert row is not None
     return row
+
+
+def _ts(hours: float) -> str:
+    return (datetime.now(UTC).replace(microsecond=0) + timedelta(hours=hours)).isoformat().replace("+00:00", "Z")
+
+
+def _set_heartbeat(ledger: Path, lease_id: str, timestamp: str) -> None:
+    with sqlite3.connect(ledger) as conn:
+        conn.execute("UPDATE leases SET heartbeat_at = ? WHERE id = ?", (timestamp, lease_id))
 
 
 def _section(html: str, slug: str) -> str:

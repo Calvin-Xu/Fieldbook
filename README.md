@@ -14,148 +14,67 @@ record jobs, refresh state, preserve provenance, export tables, and recover
 context after switching experiments. Humans can run the CLI directly, but the
 CLI and outputs are optimized for agents.
 
-## Course Project Questions
+## Features
 
-### Q1: Why did you build what you did?
+- Repo-local SQLite ledger under `.experiments/`.
+- Deterministic CLI for experiments, runs, jobs, artifacts, metrics, notes,
+  validations, sessions, advisory leases, refreshes, and reconcile events.
+- Agent-facing `status`, `context`, `workloop`, `triage`, and prompt-building
+  surfaces with JSON output.
+- Markdown-first notes for handoffs, debug logs, next actions, research notes,
+  decisions, checkpoints, and errata.
+- Explicit refresh and reconcile paths for bringing external job systems,
+  experiment trackers, local files, cloud artifacts, and dashboards back into
+  the ledger.
+- Read-only SQL query support and stable `_v1` views for dashboards and custom
+  reports.
+- Portable snapshots, long/wide metric exports, and collaborator-ready tables.
+- Optional read-only local dashboard with copyable agent instructions.
+- Optional adapters and writeback integrations that keep the SQLite ledger as
+  the source of truth.
 
-Modern ML research has become a context-switching problem. A single researcher
-may have several experiments live at once: one waiting on training, another on
-follow-up evals, another on artifact collection, and another on failed job
-recovery. Training systems, eval jobs, and coding agents can run in parallel,
-but the human interactive session is still mostly serial. The bottleneck is
-recovering enough operational context to decide what to trust and what to do
-next.
+The database is the local source of truth. External systems such as W&B, job
+schedulers, cloud storage, local files, and custom dashboards are recorded as
+linked systems and artifact pointers. Fieldbook may mirror selected summaries
+outward, but it should not depend on any external tracker as the only source of
+provenance.
 
-Fieldbook was inspired by the operating-systems idea of thread context
-switching. When an experiment blocks on external work, the agent should save
-the relevant state, switch to another experiment, later refresh external state,
-and resume without reconstructing history from chat logs, terminal scrollback,
-experiment trackers, job dashboards, cloud storage, and Markdown notes.
+## Installation
 
-### Q2: How exactly does the product work?
+From a Fieldbook checkout:
 
-Fieldbook is primarily an application/product and automation/agent-systems
-artifact. It is not a model-training method; it is infrastructure for managing
-the operational state around model-training research.
+```bash
+uv run fieldbook --help
+```
 
-The core is a local SQLite ledger, usually stored at
-`.experiments/ledger.sqlite`, with explicit entities for experiments, runs,
-jobs, artifacts, metrics, notes, validations, sessions, leases, refreshes, and
-reconcile events. An experiment is a research thread. A run is an intended
-datapoint or result row. A job is an execution attempt that may fail, retry, or
-recover a run. Artifacts and metrics record evidence; Markdown notes preserve
-handoffs, decisions, and debug context.
+From another ML repo, run Fieldbook as a sidecar tool without adding it to that
+repo's dependencies:
 
-Coding agents use the CLI and JSON surfaces to enter an experiment workloop,
-inspect bounded status, refresh external systems, reconcile evidence, write
-handoffs, and resume work. The dashboard is read-only: it lets a human scan the
-ledger and copy an agent instruction, but mutations still happen through the
-CLI and reconcile paths.
+```bash
+uv run --project <FIELDBOOK_CHECKOUT> fieldbook <command> ...
+```
 
-### Q3: Potential use cases of the product
+For W&B writeback support:
 
-The broader impact is to make agent-assisted ML research more verifiable. As
-research groups rely more on coding agents to launch jobs, inspect failures,
-refresh results, and write handoffs, the evidence trail should become clearer
-rather than more opaque. Fieldbook helps preserve the connection between a
-research question, the runs that were intended, the jobs that actually ran, the
-artifacts and metrics that were collected, and the notes explaining decisions.
-
-This is valuable for society because scientific progress depends on trust,
-reproducibility, and negative results as much as successful demos. Experiment
-state should not live only in one person's chat history or terminal scrollback.
-A local, queryable ledger makes it easier to audit what was launched, what
-failed, what evidence was collected, and how a conclusion was reached.
-
-In practice, I envision researchers using Fieldbook for active experiment
-monitoring, retry/debug triage, context switching between research threads,
-collaborator handoffs, collaborator-ready exports, and multi-agent coordination
-inside any ML repo. Fieldbook has been dogfooded against real ML research
-workflows where a single research question can involve data generation,
-training jobs, eval jobs, experiment-tracker runs, cloud artifacts, dashboards,
-and retry history.
-
-### Q4: What more would you add?
-
-The next major product concept is to make hypotheses first-class entities
-above experiments. Today, experiments are the main organizing object. In a more
-scientific workflow, a hypothesis would preregister what we expect to happen,
-why it matters, and what evidence would validate or contradict it. Experiments
-would then be grouped under hypotheses and marked as validating,
-contradicting, or inconclusive.
-
-This fits open-lab research models: code, data, experiments, mistakes, and
-negative results should be visible and reproducible. As coding agents do more of
-the operational loop, Fieldbook should make scientific claims and evidence
-trails more explicit, not less.
-
-## AI Tool Usage
-
-This project is built primarily with Codex as the coding agent. The human
-researcher provides product direction, acceptance criteria, and review; Codex
-drafts OpenSpec changes, implements migrations and CLI/dashboard code, writes
-tests, updates documentation, and dogfoods the workflow against real experiment
-state.
-
-Claude Code is used as an independent reviewer for design, OpenSpec changes,
-implementation reviews, and presentation/storyboard critique. Reviews are run
-in read-only or narrowly scoped modes where possible, and review feedback is
-patched before phases are treated as complete.
-
-OpenSpec is used to structure the staged Fieldbook buildout and preserve the
-intent of each phase. Fieldbook has been dogfooded against real ML experiment
-workflows with external job systems, experiment trackers, cloud artifacts, and
-analysis dashboards; Fieldbook itself remains a portable sidecar tool and does
-not require downstream projects to add it as a Python dependency.
-
-## Motivation
-
-Modern ML research often has more live state than fits in one conversation:
-
-- long-running jobs can finish or fail while the researcher works on another
-  direction;
-- follow-up evals may be launched days after the original training run;
-- result tables need reproducible provenance, not just copied CSVs;
-- debugging history matters when deciding whether to retry, skip, or trust a
-  datapoint;
-- collaborators need artifact exports that can be traced back to checkpoints,
-  W&B runs, commands, and code revisions.
-
-Fieldbook is designed around that workflow. It should be small enough to drop
-into any ML repo, but structured enough that agents can recover context without
-re-reading a long chat transcript.
-
-## Intended Shape
-
-Fieldbook will provide:
-
-- a repo-local SQLite database, stored under `.experiments/`;
-- a deterministic CLI for recording and querying experiments, runs, jobs,
-  artifacts, metrics, and notes;
-- compact agent-facing status summaries for context switching;
-- machine-readable JSON for agent workflows and concise text summaries for
-  human review;
-- provenance-preserving CSV/JSON exports for collaborators and dashboards;
-- a portable skill that teaches coding agents how to use the ledger;
-- optional project-specific adapters, with Marin as the first target.
-
-The database is the local source of truth. External systems such as W&B, Iris,
-GCS, Slurm, or cloud storage are recorded as linked systems and artifact
-pointers. Fieldbook may sync summaries to W&B, but it should not depend on W&B
-as the only source of provenance.
+```bash
+uv sync --extra wandb
+```
 
 ## Non-Goals
 
-The initial version will not include:
+Fieldbook is intentionally narrow. It is not:
 
 - a background polling daemon;
-- an admin web UI;
-- a replacement for MLflow, W&B, or a job scheduler;
+- a job scheduler, launcher wrapper, or cluster monitor;
+- a replacement for MLflow, W&B, or other experiment trackers;
 - automatic ingestion of every metric time series;
-- a Marin-only schema.
+- a write-capable web control plane;
+- a multi-user hosted service;
+- a raw SQL write escape hatch;
+- a repo-specific schema.
 
-Custom dashboards should be built from the SQLite database and exported tables.
-An admin UI can come later if the CLI and schema prove useful.
+The dashboard is read-only. Mutations go through the CLI, repository layer, or
+reconcile/writeback paths so that agents can audit what changed.
 
 ## Core Concepts
 
@@ -179,35 +98,6 @@ An admin UI can come later if the CLI and schema prove useful.
 - **Session**: an advisory agent context record for one working interval. It
   is not a lock; it lets agents resume, switch experiments, and stamp notes or
   reconcile events with local provenance.
-
-## Phase Index
-
-Fieldbook uses semantic OpenSpec change IDs and a human phase index in
-`PHASES.md`. Phase numbers are forward-only. Phase 11 is
-`agent-sessions-locality`, which adds ledger identity, `.fieldbook` shared
-ledger pointers, idempotent experiment creation, and advisory agent sessions.
-
-## First Implementation Phase
-
-The first phase is tracked in OpenSpec under:
-
-`openspec/changes/bootstrap-fieldbook-mvp/`
-
-That phase should establish the portable MVP:
-
-- initialize a local ledger;
-- create and inspect experiments;
-- record runs, jobs, artifacts, metrics, and notes;
-- summarize active experiment state;
-- support coding-agent context recovery through compact status, targeted
-  drilldowns, next-action notes, and JSON output;
-- support namespaced custom fields for repo-specific metadata;
-- provide a first reconcile path for Marin-style manually launched jobs;
-- export collaborator-ready tables with provenance columns.
-
-The first implementation phase intentionally keeps the agent skill as a draft
-usage guide. Publishing a stable, reusable skill is a follow-up once the CLI and
-schema have been dogfooded.
 
 ## Agent Quickstart
 
@@ -234,8 +124,8 @@ Create an experiment and capture its ID:
 EXP_ID=$(uv run fieldbook experiment create \
   --name "300M eval proxy sprint" \
   --description "Track training, follow-up evals, and exports" \
-  --tag marin \
-  --attr marin.scale=300m_6b \
+  --tag eval \
+  --attr experiment.scale=300m_6b \
   --json | python -c 'import json,sys; print(json.load(sys.stdin)["id"])')
 ```
 
@@ -249,7 +139,7 @@ RUN_ID=$(uv run fieldbook run add \
   --idempotency-key "300m-eval-proxy-sprint.run-00097" \
   --external-system wandb \
   --external-id example-wandb-run \
-  --attr marin.mixture=proportional \
+  --attr mixture.name=proportional \
   --json | python -c 'import json,sys; print(json.load(sys.stdin)["id"])')
 
 uv run fieldbook run add \
@@ -262,9 +152,9 @@ JOB_ID=$(uv run fieldbook job add \
   --run "$RUN_ID" \
   --name train \
   --status running \
-  --launcher iris \
-  --external-system iris \
-  --external-id /user/example-train \
+  --launcher scheduler \
+  --external-system scheduler \
+  --external-id example-train-job \
   --command "uv run train.py" \
   --json | python -c 'import json,sys; print(json.load(sys.stdin)["id"])')
 
@@ -286,7 +176,7 @@ SUBMIT_JOB_ID=$(uv run fieldbook job add \
   --experiment "$EXP_ID" \
   --name "eval submission" \
   --status submitting \
-  --launcher iris \
+  --launcher scheduler \
   --command "$LAUNCH_COMMAND" \
   --json | python -c 'import json,sys; print(json.load(sys.stdin)["id"])')
 
@@ -300,8 +190,8 @@ uv run fieldbook job add \
   --name "eval retry" \
   --status queued \
   --retry-of "$SUBMIT_JOB_ID" \
-  --launcher iris \
-  --external-system iris \
+  --launcher scheduler \
+  --external-system scheduler \
   --external-id "$RETRY_JOB_PATH" \
   --json
 ```
@@ -385,7 +275,7 @@ duplicates:
 ```bash
 EXP_ID=$(uv run fieldbook experiment create \
   --name "300M eval proxy sprint" \
-  --idempotency-key "marin.300m-eval-proxy-sprint" \
+  --idempotency-key "eval-proxy-sprint" \
   --json | python -c 'import json,sys; print(json.load(sys.stdin)["id"])')
 ```
 
@@ -443,8 +333,10 @@ The dashboard groups experiments by rule-derived agent lifecycle:
 
 - `Needs attention`: blocking failures, failing validations, stale submissions,
   or stale advisory leases need an agent to act.
-- `In progress`: running/submitting work, active leases, or recovery attempts
-  are still underway.
+- `Running`: queued/running jobs, submissions, or retry descendants are still
+  live external work. Active advisory leases remain visible as ownership badges
+  but do not make an idle experiment `Running`; stale leases still need
+  attention.
 - `Review`: new terminal jobs, artifacts, validations, or substantive notes
   are newer than the latest review marker.
 - `Open`: no current action is required, but the experiment is intentionally
@@ -531,24 +423,24 @@ Refresh external state explicitly through snapshots:
 ```bash
 mkdir -p .fieldbook
 cat > .fieldbook/refresh.toml <<'EOF'
-[sources.iris_jobs]
-kind = "command"
-adapter = "iris-jobs-json"
-command = ["python", "scripts/export_iris_jobs.py", "--experiment", "{experiment_id}"]
-description = "Export Iris job summaries for this experiment."
-
 [sources.metrics_csv]
 kind = "file"
 adapter = "metrics-csv"
 path = "artifacts/latest_metrics.csv"
 description = "Import a local metric CSV snapshot."
+
+[sources.job_status]
+kind = "command"
+adapter = "<adapter-name>"
+command = ["python", "scripts/export_job_status.py", "--experiment", "{experiment_id}"]
+description = "Export job summaries from this repo's scheduler."
 EOF
 
 uv run fieldbook refresh list-sources --json
-uv run fieldbook experiment workloop "$EXP_ID" --refresh iris_jobs --json
-uv run fieldbook experiment workloop "$EXP_ID" --refresh iris_jobs --apply --json
-uv run fieldbook refresh run --source iris_jobs --experiment "$EXP_ID" --json
-uv run fieldbook refresh run --source iris_jobs --experiment "$EXP_ID" --apply --json
+uv run fieldbook experiment workloop "$EXP_ID" --refresh metrics_csv --json
+uv run fieldbook experiment workloop "$EXP_ID" --refresh metrics_csv --apply --json
+uv run fieldbook refresh run --source metrics_csv --experiment "$EXP_ID" --json
+uv run fieldbook refresh run --source metrics_csv --experiment "$EXP_ID" --apply --json
 uv run fieldbook refresh log --json
 ```
 
@@ -569,7 +461,7 @@ produced one:
 ```bash
 uv run fieldbook reconcile file \
   --experiment "$EXP_ID" \
-  --path tests/fixtures/marin/eval_completion_manifest.json \
+  --path /tmp/eval_completion_manifest.json \
   --source "manual-eval-refresh" \
   --apply \
   --json
@@ -578,9 +470,9 @@ uv run fieldbook reconcile file \
 Reconcile manifests default to upsert. Rows for runs, jobs, job-run edges,
 artifacts, metrics, and notes can set `_op: "archive"` to soft-archive an
 existing row. `_op: "delete"` is intentionally rejected. Manifests can also
-append external sync events, which is useful for recording follow-up W&B, Iris,
-or artifact refresh attempts without making those systems the ledger source of
-truth:
+append external sync events, which is useful for recording follow-up W&B,
+scheduler, tracker, or artifact refresh attempts without making those systems
+the ledger source of truth:
 
 ```json
 {
@@ -685,18 +577,18 @@ reconcile manifests, which an agent can inspect and then apply explicitly:
 
 ```bash
 uv run fieldbook adapter list --json
-uv run fieldbook adapter describe iris-jobs-json --json
+uv run fieldbook adapter describe metrics-csv --json
 
-uv run fieldbook adapter run iris-jobs-json \
-  --input /tmp/iris_jobs.json \
-  --output /tmp/iris_jobs_manifest.json \
-  --debug-output /tmp/iris_jobs_debug.json \
+uv run fieldbook adapter run metrics-csv \
+  --input /tmp/latest_metrics.csv \
+  --output /tmp/metrics_manifest.json \
+  --debug-output /tmp/metrics_debug.json \
   --json
 
 uv run fieldbook reconcile file \
   --experiment "$EXP_ID" \
-  --path /tmp/iris_jobs_manifest.json \
-  --source "iris-jobs-refresh" \
+  --path /tmp/metrics_manifest.json \
+  --source "metrics-refresh" \
   --apply \
   --json
 ```

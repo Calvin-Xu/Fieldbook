@@ -17,7 +17,7 @@ Do not begin implementation tasks until 1.6 is complete.
 - [x] 2.2 Add failing tests that recovered historical failures do not create
   `Needs attention`.
 - [x] 2.3 Add failing tests that active jobs and recovery-in-progress failures
-  create `In progress`.
+  create `Running`.
 - [x] 2.4 Add failing tests that reviewable activity newer than the latest
   review marker creates `Review`.
 - [x] 2.5 Add failing tests that `mark-reviewed` creates a structured review
@@ -37,7 +37,7 @@ Do not begin implementation tasks until 1.6 is complete.
 ## 4. CLI And Dashboard
 
 - [x] 4.1 Add `fieldbook experiment mark-reviewed`.
-- [x] 4.2 Replace dashboard index groups with `Needs attention`, `In progress`,
+- [x] 4.2 Replace dashboard index groups with `Needs attention`, `Running`,
   `Review`, `Open`, and `Archived`.
 - [x] 4.3 Render `lifecycle`, `handoff_status`, and review timestamps on index
   cards/detail metrics.

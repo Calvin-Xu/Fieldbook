@@ -193,7 +193,9 @@ Dashboard lifecycle buckets are rule-derived from the ledger:
 
 - `Needs attention`: blocking failures, failing validations, stale submissions,
   or stale advisory leases need action.
-- `In progress`: jobs, submissions, leases, or recovery work are underway.
+- `Running`: queued/running jobs, submissions, or retry descendants are still
+  live external work. Active advisory leases are ownership badges, not running
+  work; stale leases still need action.
 - `Review`: new outputs or evidence are newer than the latest review marker.
 - `Open`: no current action is required, but work may be resumed later.
 - `Archived`: intentionally closed historical work.

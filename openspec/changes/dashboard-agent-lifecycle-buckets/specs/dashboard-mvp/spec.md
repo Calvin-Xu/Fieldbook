@@ -7,7 +7,7 @@ schema-aware UI.
 #### Scenario: Experiment index renders lifecycle groups
 - **WHEN** a user opens the dashboard root page
 - **THEN** it shows a category sidebar and experiments grouped by needing
-  attention, in-progress, review, open, and archived lifecycle state with
+  attention, running, review, open, and archived lifecycle state with
   compact counts and status badges
 
 #### Scenario: Handoff freshness is not a group

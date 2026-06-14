@@ -6,8 +6,6 @@ from pathlib import Path
 
 from fieldbook.db import (
     CURRENT_SCHEMA_VERSION,
-    _execute_sql_script,
-    _migration_sql,
     connect,
     discover_ledger,
     init_ledger,
@@ -278,28 +276,11 @@ def test_reconcile_hardening_schema_and_external_uniqueness(tmp_path):
         conn.close()
 
 
-def test_migration_blocks_duplicate_external_identifiers(tmp_path):
+def test_pre_coalesced_partial_ledger_requires_old_upgrade(tmp_path):
     ledger = tmp_path / "ledger.sqlite"
     conn = sqlite3.connect(ledger)
     try:
-        conn.execute("BEGIN")
-        for version in range(1, 5):
-            _execute_sql_script(conn, _migration_sql(version))
-            conn.execute(f"PRAGMA user_version = {version}")
-            conn.execute(
-                "INSERT OR REPLACE INTO schema_metadata (key, value, updated_at) "
-                "VALUES ('schema_version', ?, datetime('now'))",
-                (str(version),),
-            )
-        conn.execute(
-            "INSERT INTO runs (id, name, external_system, external_id, created_at, updated_at) "
-            "VALUES ('run_dup_a', 'A', 'wandb', 'dup', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
-        )
-        conn.execute(
-            "INSERT INTO runs (id, name, external_system, external_id, created_at, updated_at) "
-            "VALUES ('run_dup_b', 'B', 'wandb', 'dup', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
-        )
-        conn.commit()
+        conn.execute("PRAGMA user_version = 4")
     finally:
         conn.close()
 
@@ -307,8 +288,7 @@ def test_migration_blocks_duplicate_external_identifiers(tmp_path):
         connect(ledger)
     except ValidationError as exc:
         message = str(exc)
-        assert "runs" in message
-        assert "run_dup_a" in message
-        assert "run_dup_b" in message
+        assert "predates Fieldbook's coalesced migration baseline" in message
+        assert "pre-coalescing Fieldbook version" in message
     else:
-        raise AssertionError("expected migration to reject duplicate external identifiers")
+        raise AssertionError("expected pre-coalesced ledger to be rejected")

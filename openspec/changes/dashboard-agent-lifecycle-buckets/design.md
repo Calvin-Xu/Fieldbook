@@ -6,7 +6,7 @@ The dashboard index uses a deterministic single-assignment rule hierarchy:
 
 1. `archived`: experiment is archived or deleted.
 2. `needs_attention`: an agent-actionable problem exists now.
-3. `in_progress`: work is currently running or recovery is underway.
+3. `running`: live external work is queued, submitting, unknown, or running.
 4. `review`: reviewable activity exists after the latest review marker.
 5. `open`: no active work, no actionable blocker, and no pending review.
 
@@ -14,7 +14,7 @@ This is intentionally rule-derived. Coding agents affect lifecycle by recording
 facts in the ledger: job states, validations, artifacts, notes, handoffs, and
 review markers. The dashboard does not maintain private UI state.
 
-`In progress` intentionally has precedence over `Review`: if new outputs exist
+`Running` intentionally has precedence over `Review`: if new outputs exist
 while jobs are still running, the experiment remains operationally active. The
 dashboard should still render a pending-review badge so completed partial
 outputs are visible without hiding the running state.
@@ -29,15 +29,17 @@ outputs are visible without hiding the running state.
 - stale advisory leases.
 
 Recovery-in-progress failures do not enter `Needs attention` unless they become
-stale or blocking. They belong in `In progress` because an active retry is
-already the current work.
+stale or blocking. They belong in `Running` through their active retry
+descendants, which are live jobs.
 
-### In Progress
+### Running
 
-An experiment is `In progress` when it has active jobs, active leases, or
-recovery-in-progress failures. Active jobs include `queued`, `running`,
-`submitting`, and `unknown_submit`. Submission/lease staleness still escalates
-to `Needs attention` by rule precedence.
+An experiment is `Running` when it has active jobs. Active jobs include
+`queued`, `running`, `submitting`, and `unknown_submit`. Recovery work is
+running only when represented by an active retry descendant. Active advisory
+leases are ownership badges and do not make an idle experiment `Running`.
+Submission and stale lease conditions still escalate to `Needs attention` by
+rule precedence.
 
 ### Reviewable Activity
 
@@ -111,7 +113,7 @@ do not imply an experiment lifecycle state by themselves.
 Dashboard handlers and prompt builders compute lifecycle from this stable view
 rather than joining internal tables directly.
 
-Canonical `lifecycle_state` tokens are `needs_attention`, `in_progress`,
+Canonical `lifecycle_state` tokens are `needs_attention`, `running`,
 `review`, `open`, and `archived`. Dashboard labels are display formatting only.
 
 ### Prompt Action

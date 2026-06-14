@@ -14,7 +14,7 @@ dashboard summary view and closed prompt catalog introduced there.
 
 ## What Changes
 
-- Replace the dashboard index groups with `Needs attention`, `In progress`,
+- Replace the dashboard index groups with `Needs attention`, `Running`,
   `Review`, `Open`, and `Archived`.
 - Keep handoff freshness as a badge/detail and prompt action, not as a
   lifecycle bucket.
